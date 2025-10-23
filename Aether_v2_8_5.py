@@ -232,6 +232,7 @@ from typing import Optional, List, Tuple, Dict, Any
 import numpy as np
 
 import torch
+from torch.amp import GradScaler
 
 
 # === Aether injected: GaLore-like low-rank optimizer (matrix params only) ==============
@@ -1616,6 +1617,25 @@ class TrainConfig:
     galore_rank: int = 64
     # GQA
     kv_heads: Optional[int] = None
+    # M4 / MPS runtime controls
+    prefer_bfloat16: bool = True
+    matmul_precision: str = "high"
+    compile: bool = False
+    compile_backend: str = "aot_eager"
+    compile_dynamic: bool = False
+    adaptive_microbatch: bool = True
+    adaptive_micro_max: int = 16
+    adaptive_micro_recover: int = 256
+    oom_retries: int = 3
+    grad_scaler: bool = True
+    empty_cache_every: int = 0
+    # Data pipeline / host→device controls
+    loader_num_workers: int = 0
+    loader_prefetch_factor: int = 2
+    loader_persistent_workers: bool = False
+    loader_pin_memory: bool = False
+    prefetch_to_device: bool = True
+    disallow_mps_fallback: bool = True
 
 
 class FabricLite:
@@ -1975,7 +1995,29 @@ class AetherTrainerBase:
         self.tok = tok
         self.cfg = cfg
         self.device = detect_device()
+
+        matmul_mode = getattr(self.cfg, "matmul_precision", None)
+        if matmul_mode:
+            try:
+                torch.set_float32_matmul_precision(str(matmul_mode))
+                print(f"[AMP] matmul precision set to {matmul_mode}")
+            except Exception as e:
+                print("[AMP] matmul precision set failed:", e)
+
         self.model.to(self.device)
+
+        if getattr(self.cfg, "compile", False):
+            backend = getattr(self.cfg, "compile_backend", "aot_eager")
+            dynamic = bool(getattr(self.cfg, "compile_dynamic", False))
+            try:
+                self.model = torch.compile(
+                    self.model, backend=str(backend), dynamic=dynamic
+                )
+                print(
+                    f"[COMPILE] torch.compile enabled (backend={backend}, dynamic={dynamic})"
+                )
+            except Exception as e:
+                print("[COMPILE] torch.compile failed:", e)
         enable_tiled_sdpa(cfg.tiled_q, cfg.tiled_k, compute_in_fp32=True)
         try:
             set_sliding_window(
@@ -2024,10 +2066,45 @@ class AetherTrainerBase:
                     )
                 )
                 print("[OPT] AdamW on MPS")
+
+        if self.device.type == "mps" and getattr(self.cfg, "prefer_bfloat16", True):
+            try:
+                torch.zeros(1, device=self.device, dtype=torch.bfloat16)
+                self.amp_dtype = torch.bfloat16
+                print("[AMP] Using bfloat16 autocast on MPS")
+            except Exception:
+                self.amp_dtype = torch.float16
+                print("[AMP] Falling back to float16 autocast")
+        else:
             self.amp_dtype = torch.float16
 
         if not hasattr(self, "amp_dtype"):
             self.amp_dtype = torch.float16
+
+        self._scaler_enabled = self.device.type == "mps" and bool(
+            getattr(self.cfg, "grad_scaler", True)
+        )
+        self.scaler = GradScaler() if self._scaler_enabled else None
+        if self.scaler is not None:
+            print("[AMP] GradScaler(mps) enabled")
+
+        self._prefetch_to_device = (
+            self.device.type == "mps"
+            and bool(getattr(self.cfg, "prefetch_to_device", True))
+        )
+        if self._prefetch_to_device:
+            print("[MPS] host batch prefetch enabled")
+
+        if self.device.type == "mps" and bool(
+            getattr(self.cfg, "disallow_mps_fallback", True)
+        ):
+            try:
+                import torch.backends.mps as _mps_backend
+
+                _mps_backend.fallback_allow_all(False)
+                print("[MPS] CPU fallback disabled (strict MPS kernels)")
+            except Exception as e:
+                print("[MPS] fallback control unavailable:", e)
 
         self._teacher = None
         if (self.cfg.intent_weight > 0.0) or bool(
@@ -2050,6 +2127,24 @@ class AetherTrainerBase:
         self._lvi_cache = {"bias": None, "logs": None, "step": -1}
         # ANI-AI controller (opt-in via env)
         self._ai = _AetherNumpyAIController(self)
+        # Adaptive micro-batch & memory controls
+        self._adaptive_micro = bool(getattr(self.cfg, "adaptive_microbatch", True))
+        self._micro_active = max(1, int(getattr(self.cfg, "micro_batch", 1)))
+        self._micro_base = self._micro_active
+        self._micro_cap = max(
+            self._micro_active,
+            int(getattr(self.cfg, "adaptive_micro_max", self._micro_active)),
+        )
+        self._micro_recover_every = max(
+            0, int(getattr(self.cfg, "adaptive_micro_recover", 256))
+        )
+        self._micro_stable = 0
+        self._oom_retry_limit = max(0, int(getattr(self.cfg, "oom_retries", 3)))
+        self._empty_cache_every = max(0, int(getattr(self.cfg, "empty_cache_every", 0)))
+        if self._adaptive_micro and self._micro_cap > self._micro_base:
+            print(
+                f"[ADAPT] micro_batch base={self._micro_base}, cap={self._micro_cap}"
+            )
         # --- k-bridge integration knobs (safe opt-in; default on if installed) ---
         self._k_enabled = bool(
             int(os.environ.get("KBRIDGE_ENABLE", "1" if _KBRIDGE_AVAILABLE else "0"))
@@ -2116,6 +2211,24 @@ class AetherTrainerBase:
             float(x)
             for x in os.environ.get("KBRIDGE_TSWEEP", "").split(",")
             if x.strip()
+        ]
+
+    def _rebuild_optimizer(self):
+        wd = 0.01
+        if getattr(self.cfg, "opt_cpu8bit", False):
+            self.opt = CPUAdamW8(
+                [p for p in self.model.parameters() if p.requires_grad],
+                lr=self.cfg.lr,
+                betas=(0.9, 0.95),
+                eps=1e-8,
+                weight_decay=wd,
+                quantize_v=True,
+            )
+            print("[OPT] CPUAdamW8 (v:int8, m:fp16)")
+        else:
+            self.opt = (
+                GaLoreAdamW(
+                    [p for p in self.model.parameters() if p.requires_grad],
                     lr=self.cfg.lr,
                     betas=(0.9, 0.95),
                     eps=1e-8,
@@ -2131,6 +2244,7 @@ class AetherTrainerBase:
                     weight_decay=wd,
                 )
             )
+            print("[OPT] AdamW on MPS")
 
     def _relora_cycle(self):
         if not PEFT_AVAILABLE or not isinstance(self.model, PeftModel):
@@ -2158,14 +2272,26 @@ class AetherTrainerBase:
 
     def _make_loader(self, ds, shuffle, max_len_for_collate):
         is_iter = isinstance(ds, IterableDataset)
-        return DataLoader(
-            ds,
+        num_workers = max(0, int(getattr(self.cfg, "loader_num_workers", 0)))
+        persistent = (
+            num_workers > 0
+            and bool(getattr(self.cfg, "loader_persistent_workers", False))
+        )
+        pin_memory = bool(getattr(self.cfg, "loader_pin_memory", False))
+        loader_kwargs = dict(
             batch_size=self.cfg.batch_size,
             shuffle=(False if is_iter else bool(shuffle)),
-            num_workers=0,
-            pin_memory=False,
-            persistent_workers=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent,
             collate_fn=lambda b: collate_lm_safe(b, pad_id=self.tok.PAD),
+        )
+        prefetch_factor = getattr(self.cfg, "loader_prefetch_factor", None)
+        if num_workers > 0 and prefetch_factor is not None:
+            loader_kwargs["prefetch_factor"] = max(1, int(prefetch_factor))
+        return DataLoader(
+            ds,
+            **loader_kwargs,
         )
 
     def _ce_loss(
@@ -2284,8 +2410,6 @@ class AetherTrainerMPS(AetherTrainerBase):
         self.model.train()
         t0 = time.time()
         step = self._global_step
-        micro = max(1, int(self.cfg.micro_batch))
-
         for epoch in range(self.cfg.epochs if self.cfg.max_steps is None else 10**9):
             for bx, by in train_dl:
                 p = curr_params(step + 1)
@@ -2302,157 +2426,281 @@ class AetherTrainerMPS(AetherTrainerBase):
                 bx = self.psy.apply_input(bx, pad_id)
 
                 B, T = bx.shape
-                chunk_bs = max(1, math.ceil(B / micro))
                 total_loss, total_tok = 0.0, 0
                 accum = 0
-                for s in range(0, B, chunk_bs):
-                    subx = bx[s : s + chunk_bs].to(self.device, non_blocking=True)
-                    suby = by[s : s + chunk_bs].to(self.device, non_blocking=True)
+                logits = None
+                lvi_logs = {
+                    "mv_reg": torch.tensor(0.0, device=self.device),
+                    "two_view": torch.tensor(0.0, device=self.device),
+                }
+                oom_count = 0
+                last_oom_err = None
+                bx_cpu, by_cpu = bx, by
 
-                    # AI pre-forward planning
-                    try:
-                        plan = self._ai.plan_pre_forward()
-                        self._ai_fp32_logits = bool(plan.get("fp32_logits", False))
-                    except Exception:
-                        self._ai_fp32_logits = bool(
-                            int(os.environ.get("AETHER_FP32_LOGITS", "0"))
-                        )
-                    with torch.autocast(device_type="mps", dtype=self.amp_dtype):
-                        logits, lvi_logs = self._compute_logits(subx)
-                        _pf = {}
+                while True:
+                    total_loss = 0.0
+                    total_tok = 0
+                    accum = 0
+                    idx = 0
+                    restart_batch = False
+                    batch_on_device = None
+
+                    if self._prefetch_to_device:
                         try:
-                            _pf = self._ai.post_forward_assess(
-                                logits, subx=subx, suby=suby, pad_id=pad_id
+                            batch_on_device = (
+                                bx_cpu.to(self.device, non_blocking=True),
+                                by_cpu.to(self.device, non_blocking=True),
                             )
-                        except Exception:
-                            pass
-                    # ★ CE は常に FP32・autocast 無効で計算（数値安定のため）
-                    with torch.autocast(device_type="mps", enabled=False):
-                        loss_ce = self._ce_loss(logits, suby, pad_id)
-
-                        loss_ce = self._ce_loss(logits, suby, pad_id)
-                        loss = (
-                            loss_ce
-                            + float(self.cfg.lvi_mv_weight) * lvi_logs["mv_reg"]
-                            + float(self.cfg.lvi_two_view_weight) * lvi_logs["two_view"]
-                        )
-
-                        # ANI-AI observe forward
-                        try:
-                            self._ai.observe_forward(loss, logits)
-                        except Exception:
-                            pass
-
-                        # --- K-bridge weak Huber regularizer (optional, safe default off)
-                        if (
-                            self._k_enabled
-                            and _KBRIDGE_AVAILABLE
-                            and (self._k_reg_w > 0.0)
-                            and (self._teacher is not None)
-                        ):
-                            try:
-                                with torch.no_grad():
-                                    probs = torch.softmax(logits.float(), dim=-1)
-                                    emb_w = self.model.emb.weight.float()
-                                    E_pred = torch.einsum("btv,vd->btd", probs, emb_w)
-                                    E_bar = E_pred.mean(dim=1)
-                                    t_pos = self._teacher(subx).to(
-                                        E_bar.device, dtype=E_bar.dtype
-                                    )
-                                loss = loss + float(self._k_reg_w) * khuber_loss(
-                                    E_bar, t_pos, delta=1.0
+                        except RuntimeError as e:
+                            if self._maybe_handle_oom(e, B * T):
+                                restart_batch = True
+                                oom_count += 1
+                                last_oom_err = e
+                                self.opt.zero_grad(set_to_none=True)
+                                if self._scaler_enabled:
+                                    self.scaler = GradScaler()
+                                    print("[OOM] GradScaler reset after OOM")
+                            else:
+                                print(
+                                    "[MPS] host batch prefetch disabled after error:",
+                                    e,
                                 )
-                            except Exception:
-                                pass
+                                self._prefetch_to_device = False
+                            batch_on_device = None
 
-                        if getattr(self.cfg, "intent_weight", 0.0) > 0.0:
-                            every = max(1, int(getattr(self.cfg, "intent_every", 1)))
-                            do_int = (every <= 1) or (self._global_step % every == 0)
-                            if do_int and (self._teacher is not None):
+                    if restart_batch:
+                        if self._oom_retry_limit and oom_count > self._oom_retry_limit:
+                            raise last_oom_err
+                        continue
+
+                    while idx < B:
+                        current_micro = max(1, int(self._micro_active))
+                        chunk_bs = max(1, math.ceil(B / current_micro))
+                        end = min(B, idx + chunk_bs)
+                        if batch_on_device is not None:
+                            subx = batch_on_device[0][idx:end]
+                            suby = batch_on_device[1][idx:end]
+                        else:
+                            subx = bx_cpu[idx:end].to(
+                                self.device, non_blocking=True
+                            )
+                            suby = by_cpu[idx:end].to(
+                                self.device, non_blocking=True
+                            )
+
+                        # AI pre-forward planning
+                        try:
+                            plan = self._ai.plan_pre_forward()
+                            self._ai_fp32_logits = bool(plan.get("fp32_logits", False))
+                        except Exception:
+                            self._ai_fp32_logits = bool(
+                                int(os.environ.get("AETHER_FP32_LOGITS", "0"))
+                            )
+
+                        try:
+                            with torch.autocast(
+                                device_type="mps", dtype=self.amp_dtype
+                            ):
+                                logits, lvi_logs = self._compute_logits(subx)
+                                _pf = {}
                                 try:
-                                    emb_w = getattr(self.model, "emb", None)
-                                    if emb_w is not None:
-                                        t_pos = self._teacher(subx)
-                                        neg_ids = _make_negative_ids(subx)
-                                        t_neg = self._teacher(neg_ids)
-                                        loss_int = _contrastive_intent_loss(
-                                            logits,
-                                            suby,
-                                            emb_w.weight,
-                                            pad_id,
-                                            t_pos,
-                                            t_neg,
-                                            margin=float(
-                                                getattr(self.cfg, "intent_margin", 0.10)
-                                            ),
-                                            sample_frac=float(
-                                                getattr(
-                                                    self.cfg, "intent_sample_frac", 0.25
-                                                )
-                                            ),
-                                        )
-                                        loss = (
-                                            loss
-                                            + float(self.cfg.intent_weight) * loss_int
-                                        )
+                                    _pf = self._ai.post_forward_assess(
+                                        logits, subx=subx, suby=suby, pad_id=pad_id
+                                    )
+                                except Exception:
+                                    pass
+                            # ★ CE は常に FP32・autocast 無効で計算（数値安定のため）
+                            with torch.autocast(device_type="mps", enabled=False):
+                                loss_ce = self._ce_loss(logits, suby, pad_id)
+                                loss = (
+                                    loss_ce
+                                    + float(self.cfg.lvi_mv_weight) * lvi_logs["mv_reg"]
+                                    + float(self.cfg.lvi_two_view_weight)
+                                    * lvi_logs["two_view"]
+                                )
+
+                                # ANI-AI observe forward
+                                try:
+                                    self._ai.observe_forward(loss, logits)
                                 except Exception:
                                     pass
 
-                        loss = loss / max(1, micro)
+                                # --- K-bridge weak Huber regularizer (optional, safe default off)
+                                if (
+                                    self._k_enabled
+                                    and _KBRIDGE_AVAILABLE
+                                    and (self._k_reg_w > 0.0)
+                                    and (self._teacher is not None)
+                                ):
+                                    try:
+                                        with torch.no_grad():
+                                            probs = torch.softmax(
+                                                logits.float(), dim=-1
+                                            )
+                                            emb_w = self.model.emb.weight.float()
+                                            E_pred = torch.einsum(
+                                                "btv,vd->btd", probs, emb_w
+                                            )
+                                            E_bar = E_pred.mean(dim=1)
+                                            t_pos = self._teacher(subx).to(
+                                                E_bar.device, dtype=E_bar.dtype
+                                            )
+                                        loss = loss + float(self._k_reg_w) * khuber_loss(
+                                            E_bar, t_pos, delta=1.0
+                                        )
+                                    except Exception:
+                                        pass
 
-                    if _pf.get("hazard", False):
-                        try:
-                            self._ai.sanitize_gradients(self.model)
-                        except Exception:
-                            pass
-                        self.opt.zero_grad(set_to_none=True)
-                    else:
-                        loss.backward()
-                    # ANI-AI observe grads
-                    try:
-                        self._ai.observe_grads(self.model)
-                    except Exception:
-                        pass
-                    self._zero_nonfinite_grads()
-                    accum += 1
+                                if getattr(self.cfg, "intent_weight", 0.0) > 0.0:
+                                    every = max(1, int(getattr(self.cfg, "intent_every", 1)))
+                                    do_int = (every <= 1) or (
+                                        self._global_step % every == 0
+                                    )
+                                    if do_int and (self._teacher is not None):
+                                        try:
+                                            emb_w = getattr(self.model, "emb", None)
+                                            if emb_w is not None:
+                                                t_pos = self._teacher(subx)
+                                                neg_ids = _make_negative_ids(subx)
+                                                t_neg = self._teacher(neg_ids)
+                                                loss_int = _contrastive_intent_loss(
+                                                    logits,
+                                                    suby,
+                                                    emb_w.weight,
+                                                    pad_id,
+                                                    t_pos,
+                                                    t_neg,
+                                                    margin=float(
+                                                        getattr(
+                                                            self.cfg,
+                                                            "intent_margin",
+                                                            0.10,
+                                                        )
+                                                    ),
+                                                    sample_frac=float(
+                                                        getattr(
+                                                            self.cfg,
+                                                            "intent_sample_frac",
+                                                            0.25,
+                                                        )
+                                                    ),
+                                                )
+                                                loss = (
+                                                    loss
+                                                    + float(self.cfg.intent_weight)
+                                                    * loss_int
+                                                )
+                                        except Exception:
+                                            pass
 
-                    ntok = int((suby != pad_id).sum().item())
-                    total_tok += ntok
-                    total_loss += float(loss_ce.detach().cpu().item()) * ntok
+                                loss = loss / max(1, current_micro)
+                        except RuntimeError as e:
+                            if self._maybe_handle_oom(e, B):
+                                restart_batch = True
+                                oom_count += 1
+                                last_oom_err = e
+                                self.opt.zero_grad(set_to_none=True)
+                                if self._scaler_enabled:
+                                    self.scaler = GradScaler()
+                                    print("[OOM] GradScaler reset after OOM")
+                                break
+                            raise
 
-                    if accum >= micro:
-                        if self.cfg.grad_clip and self.cfg.grad_clip > 0:
-                            torch.nn.utils.clip_grad_norm_(
-                                self.model.parameters(), self.cfg.grad_clip
-                            )
-                        # ANI-AI: skip step if requested
-                        if hasattr(self, "_ai") and self._ai.should_skip():
+                        if restart_batch:
+                            break
+
+                        if _pf.get("hazard", False):
+                            try:
+                                self._ai.sanitize_gradients(self.model)
+                            except Exception:
+                                pass
                             self.opt.zero_grad(set_to_none=True)
+                            if self.scaler is not None:
+                                self.scaler.update()
                         else:
-                            self.opt.step()
-                            self.opt.zero_grad(set_to_none=True)
-                        # ANI-AI decide/act
+                            if self.scaler is not None:
+                                self.scaler.scale(loss).backward()
+                            else:
+                                loss.backward()
+                        # ANI-AI observe grads
                         try:
-                            self._ai.decide_and_act(step)
+                            self._ai.observe_grads(self.model)
                         except Exception:
                             pass
-                        try:
-                            if up is not None:
-                                up.mps_empty_cache_safe()
-                        except Exception:
-                            pass
-                        accum = 0
+                        self._zero_nonfinite_grads()
+                        accum += 1
+
+                        ntok = int((suby != pad_id).sum().item())
+                        total_tok += ntok
+                        total_loss += float(loss_ce.detach().cpu().item()) * ntok
+
+                        current_micro = max(1, int(self._micro_active))
+                        if accum >= current_micro:
+                            if self.scaler is not None:
+                                self.scaler.unscale_(self.opt)
+                            if self.cfg.grad_clip and self.cfg.grad_clip > 0:
+                                torch.nn.utils.clip_grad_norm_(
+                                    self.model.parameters(), self.cfg.grad_clip
+                                )
+                            # ANI-AI: skip step if requested
+                            if hasattr(self, "_ai") and self._ai.should_skip():
+                                if self.scaler is not None:
+                                    self.scaler.update()
+                                self.opt.zero_grad(set_to_none=True)
+                            else:
+                                if self.scaler is not None:
+                                    self.scaler.step(self.opt)
+                                    self.scaler.update()
+                                else:
+                                    self.opt.step()
+                                self.opt.zero_grad(set_to_none=True)
+                            # ANI-AI decide/act
+                            try:
+                                self._ai.decide_and_act(step)
+                            except Exception:
+                                pass
+                            try:
+                                if up is not None:
+                                    up.mps_empty_cache_safe()
+                            except Exception:
+                                pass
+                            if (
+                                self._empty_cache_every > 0
+                                and ((step + 1) % self._empty_cache_every == 0)
+                                and self.device.type == "mps"
+                            ):
+                                try:
+                                    torch.mps.empty_cache()
+                                except Exception:
+                                    pass
+                            accum = 0
+
+                        idx = end
+
+                    if restart_batch:
+                        if self._oom_retry_limit and oom_count > self._oom_retry_limit:
+                            raise last_oom_err
+                        continue
+                    break
 
                 if accum > 0:
+                    if self.scaler is not None:
+                        self.scaler.unscale_(self.opt)
                     if self.cfg.grad_clip and self.cfg.grad_clip > 0:
                         torch.nn.utils.clip_grad_norm_(
                             self.model.parameters(), self.cfg.grad_clip
                         )
                     # ANI-AI: skip step if requested
                     if hasattr(self, "_ai") and self._ai.should_skip():
+                        if self.scaler is not None:
+                            self.scaler.update()
                         self.opt.zero_grad(set_to_none=True)
                     else:
-                        self.opt.step()
+                        if self.scaler is not None:
+                            self.scaler.step(self.opt)
+                            self.scaler.update()
+                        else:
+                            self.opt.step()
                         self.opt.zero_grad(set_to_none=True)
                     # ANI-AI decide/act
                     try:
@@ -2464,6 +2712,15 @@ class AetherTrainerMPS(AetherTrainerBase):
                             up.mps_empty_cache_safe()
                     except Exception:
                         pass
+                    if (
+                        self._empty_cache_every > 0
+                        and ((step + 1) % self._empty_cache_every == 0)
+                        and self.device.type == "mps"
+                    ):
+                        try:
+                            torch.mps.empty_cache()
+                        except Exception:
+                            pass
 
                 if self.cfg.mps_sync_every > 0 and (
                     step % self.cfg.mps_sync_every == 0
@@ -2481,6 +2738,23 @@ class AetherTrainerMPS(AetherTrainerBase):
                 lr_mult = sched.step()
                 step += 1
                 self._global_step = step
+
+                if self._adaptive_micro:
+                    if self._micro_active > self._micro_base:
+                        self._micro_stable += 1
+                        if (
+                            self._micro_recover_every > 0
+                            and self._micro_stable >= self._micro_recover_every
+                        ):
+                            new_micro = max(self._micro_base, self._micro_active // 2)
+                            if new_micro < self._micro_active:
+                                self._micro_active = new_micro
+                                print(
+                                    f"[ADAPT] micro_batch relaxed to {self._micro_active}"
+                                )
+                            self._micro_stable = 0
+                    else:
+                        self._micro_stable = 0
 
                 if int(getattr(self.cfg, "relora_every", 0)) > 0 and (
                     step % int(self.cfg.relora_every) == 0
@@ -2620,21 +2894,33 @@ class AetherTrainerMPS(AetherTrainerBase):
                                     eT, _, _, _ = ece_and_hist_k(
                                         pmT, lbT, n_bins=max(2, self._kb_ece_bins)
                                   )
-                        try:
-                            V = int(logits.shape[-1])
-                            mask = (suby != pad_id)
-                            tmin = int(suby[mask].min().item()) if mask.any() else -1
-                            tmax = int(suby[mask].max().item()) if mask.any() else -1
-                            lmax = float(logits.detach().float().abs().amax().item())
-                            with torch.no_grad():
-                               p = torch.softmax(logits.detach().float(), dim=-1)
-                               pm = p[mask]; ty = suby[mask]
-                               ce_manual = float((-torch.log(pm[torch.arange(pm.size(0)), ty.view(-1)] + 1e-12)).mean().item())
-                               top1 = float(pm.max(dim=-1).values.mean().item())
-                            print(f"[DBG] V={V} target=[{tmin},{tmax}] | logits|max|={lmax:.2e} | ce_manual={ce_manual:.3f} | top1={top1:.3f}")
-                            assert tmax < V, f"target id {tmax} >= vocab {V}"
-                        except Exception as e:
-                            print("[DBG] sanity failed:", e)
+                                    try:
+                                        V = int(logits.shape[-1])
+                                        mask = (suby != pad_id)
+                                        tmin = int(suby[mask].min().item()) if mask.any() else -1
+                                        tmax = int(suby[mask].max().item()) if mask.any() else -1
+                                        lmax = float(logits.detach().float().abs().amax().item())
+                                        with torch.no_grad():
+                                            p = torch.softmax(logits.detach().float(), dim=-1)
+                                            pm = p[mask]
+                                            ty = suby[mask]
+                                            ce_manual = float(
+                                                (
+                                                    -torch.log(
+                                                        pm[torch.arange(pm.size(0)), ty.view(-1)] + 1e-12
+                                                    )
+                                                )
+                                                .mean()
+                                                .item()
+                                            )
+                                            top1 = float(pm.max(dim=-1).values.mean().item())
+                                        print(
+                                            f"[DBG] V={V} target=[{tmin},{tmax}] | logits|max|={lmax:.2e} "
+                                            f"| ce_manual={ce_manual:.3f} | top1={top1:.3f}"
+                                        )
+                                        assert tmax < V, f"target id {tmax} >= vocab {V}"
+                                    except Exception as e:
+                                        print("[DBG] sanity failed:", e)
 
                                     self.fabric.log(
                                         {f"eval/ece_T{Tval:g}": float(eT)}, step=step
@@ -2880,6 +3166,39 @@ class AetherTrainerMPS(AetherTrainerBase):
             if self.cfg.max_steps and step >= self.cfg.max_steps:
                 break
 
+    def _maybe_handle_oom(self, err: RuntimeError, batch_tokens: int) -> bool:
+        if not getattr(self, "_adaptive_micro", False):
+            return False
+        msg = str(err).lower()
+        keywords = (
+            "out of memory",
+            "mps backend out of memory",
+            "failed to allocate",
+            "resource exhausted",
+        )
+        if not any(k in msg for k in keywords):
+            return False
+        if self._micro_active >= self._micro_cap:
+            print(
+                f"[OOM] {err} -- micro_batch cap reached ({self._micro_active}); aborting"
+            )
+            return False
+        prev = self._micro_active
+        self._micro_active = min(
+            self._micro_cap, max(prev + 1, prev * 2)
+        )
+        self._micro_stable = 0
+        approx_chunk = max(1, math.ceil(batch_tokens / self._micro_active))
+        print(
+            f"[OOM] {err} -- increasing micro_batch to {self._micro_active} (chunk≈{approx_chunk})"
+        )
+        if self.device.type == "mps":
+            try:
+                torch.mps.empty_cache()
+            except Exception:
+                pass
+        return True
+
     def _zero_nonfinite_grads(self):
         for p in self.model.parameters():
             if p.grad is None:
@@ -2954,6 +3273,11 @@ def __aether_main__():
     ap.add_argument("--val_glob", type=str, default="")
     ap.add_argument("--pack_len", type=int, default=1024)
     ap.add_argument("--buffer_size", type=int, default=8192)
+    ap.add_argument("--loader_workers", type=int, default=0)
+    ap.add_argument("--loader_prefetch", type=int, default=2)
+    ap.add_argument("--loader_persistent_workers", action="store_true")
+    ap.add_argument("--loader_pin_memory", action="store_true")
+    ap.add_argument("--no_prefetch_to_device", action="store_true")
     # model
     ap.add_argument("--vocab_size", type=int, default=32000)
     ap.add_argument("--d_model", type=int, default=4096)
@@ -2983,6 +3307,7 @@ def __aether_main__():
     ap.add_argument("--global_tokens", type=int, default=0)
     ap.add_argument("--global_stride", type=int, default=0)
     ap.add_argument("--mps_sync_every", type=int, default=0)
+    ap.add_argument("--allow_mps_cpu_fallback", action="store_true")
     # optimizer
     ap.add_argument("--opt_cpu8bit", action="store_true")
     ap.add_argument("--opt_galore", action="store_true")
@@ -3139,6 +3464,12 @@ def __aether_main__():
         lvi_k=int(args.lvi_k),
         lvi_alpha_mode=str(args.lvi_alpha_mode),
         lvi_every=int(args.lvi_every),
+        loader_num_workers=int(args.loader_workers),
+        loader_prefetch_factor=int(args.loader_prefetch),
+        loader_persistent_workers=bool(args.loader_persistent_workers),
+        loader_pin_memory=bool(args.loader_pin_memory),
+        prefetch_to_device=not bool(args.no_prefetch_to_device),
+        disallow_mps_fallback=not bool(args.allow_mps_cpu_fallback),
     )
     cfg.safetensor_every = int(getattr(args, "safetensor_every", 0))
     cfg.curriculum = [
