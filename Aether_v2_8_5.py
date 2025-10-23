@@ -2116,6 +2116,24 @@ class AetherTrainerBase:
             float(x)
             for x in os.environ.get("KBRIDGE_TSWEEP", "").split(",")
             if x.strip()
+        ]
+
+    def _rebuild_optimizer(self):
+        wd = 0.01
+        if getattr(self.cfg, "opt_cpu8bit", False):
+            self.opt = CPUAdamW8(
+                [p for p in self.model.parameters() if p.requires_grad],
+                lr=self.cfg.lr,
+                betas=(0.9, 0.95),
+                eps=1e-8,
+                weight_decay=wd,
+                quantize_v=True,
+            )
+            print("[OPT] CPUAdamW8 (v:int8, m:fp16)")
+        else:
+            self.opt = (
+                GaLoreAdamW(
+                    [p for p in self.model.parameters() if p.requires_grad],
                     lr=self.cfg.lr,
                     betas=(0.9, 0.95),
                     eps=1e-8,
@@ -2131,6 +2149,7 @@ class AetherTrainerBase:
                     weight_decay=wd,
                 )
             )
+            print("[OPT] AdamW on MPS")
 
     def _relora_cycle(self):
         if not PEFT_AVAILABLE or not isinstance(self.model, PeftModel):
@@ -2620,21 +2639,33 @@ class AetherTrainerMPS(AetherTrainerBase):
                                     eT, _, _, _ = ece_and_hist_k(
                                         pmT, lbT, n_bins=max(2, self._kb_ece_bins)
                                   )
-                        try:
-                            V = int(logits.shape[-1])
-                            mask = (suby != pad_id)
-                            tmin = int(suby[mask].min().item()) if mask.any() else -1
-                            tmax = int(suby[mask].max().item()) if mask.any() else -1
-                            lmax = float(logits.detach().float().abs().amax().item())
-                            with torch.no_grad():
-                               p = torch.softmax(logits.detach().float(), dim=-1)
-                               pm = p[mask]; ty = suby[mask]
-                               ce_manual = float((-torch.log(pm[torch.arange(pm.size(0)), ty.view(-1)] + 1e-12)).mean().item())
-                               top1 = float(pm.max(dim=-1).values.mean().item())
-                            print(f"[DBG] V={V} target=[{tmin},{tmax}] | logits|max|={lmax:.2e} | ce_manual={ce_manual:.3f} | top1={top1:.3f}")
-                            assert tmax < V, f"target id {tmax} >= vocab {V}"
-                        except Exception as e:
-                            print("[DBG] sanity failed:", e)
+                                    try:
+                                        V = int(logits.shape[-1])
+                                        mask = (suby != pad_id)
+                                        tmin = int(suby[mask].min().item()) if mask.any() else -1
+                                        tmax = int(suby[mask].max().item()) if mask.any() else -1
+                                        lmax = float(logits.detach().float().abs().amax().item())
+                                        with torch.no_grad():
+                                            p = torch.softmax(logits.detach().float(), dim=-1)
+                                            pm = p[mask]
+                                            ty = suby[mask]
+                                            ce_manual = float(
+                                                (
+                                                    -torch.log(
+                                                        pm[torch.arange(pm.size(0)), ty.view(-1)] + 1e-12
+                                                    )
+                                                )
+                                                .mean()
+                                                .item()
+                                            )
+                                            top1 = float(pm.max(dim=-1).values.mean().item())
+                                        print(
+                                            f"[DBG] V={V} target=[{tmin},{tmax}] | logits|max|={lmax:.2e} "
+                                            f"| ce_manual={ce_manual:.3f} | top1={top1:.3f}"
+                                        )
+                                        assert tmax < V, f"target id {tmax} >= vocab {V}"
+                                    except Exception as e:
+                                        print("[DBG] sanity failed:", e)
 
                                     self.fabric.log(
                                         {f"eval/ece_T{Tval:g}": float(eT)}, step=step
