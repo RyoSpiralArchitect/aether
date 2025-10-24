@@ -50,6 +50,102 @@ if _aos.environ.get("AETHER_DISABLE_MPS_WM_PATCH", "0") != "1":
     _aether_patch_mps_watermark()
 
 
+# ------------------------------
+# 1b) Optional MPS warm-up pump
+# ------------------------------
+def _aether_pump_mps():
+    """Run a short burst of heavy MPS matmuls to fully wake up the GPU."""
+
+    cfg = _aos.environ.get("AETHER_MPS_PUMP", "0").strip().lower()
+    if cfg in {"", "0", "false", "off"}:
+        return
+
+    try:
+        import math as _math
+        import time as _time
+        import torch
+    except Exception:
+        return
+
+    if not hasattr(torch, "mps"):
+        return
+    backend_ok = getattr(torch.backends, "mps", None)
+    if backend_ok is None or not getattr(backend_ok, "is_available", lambda: False)():
+        return
+
+    device = torch.device("mps")
+    dtype_name = _aos.environ.get("AETHER_MPS_PUMP_DTYPE", "float16").strip().lower()
+    dtype = getattr(torch, dtype_name, torch.float16)
+
+    try:
+        size = int(float(_aos.environ.get("AETHER_MPS_PUMP_SIZE", "2048")))
+    except Exception:
+        size = 2048
+    size = max(256, min(size, 8192))
+
+    try:
+        budget_s = float(_aos.environ.get("AETHER_MPS_PUMP_SEC", "2.0"))
+    except Exception:
+        budget_s = 2.0
+    budget_s = max(0.25, min(budget_s, 10.0))
+
+    try:
+        max_iters = int(float(_aos.environ.get("AETHER_MPS_PUMP_MAX_ITERS", "64")))
+    except Exception:
+        max_iters = 64
+    max_iters = max(1, min(max_iters, 512))
+
+    sync = getattr(torch.mps, "synchronize", None)
+
+    start = _time.time()
+    iters = 0
+    energy = 0.0
+
+    with torch.no_grad():
+        try:
+            a = torch.randn((size, size), device=device, dtype=dtype)
+            b = torch.randn((size, size), device=device, dtype=dtype)
+        except Exception as exc:
+            print(f"[MPS] pump allocation failed ({exc}); aborting warm-up")
+            return
+
+        try:
+            while iters < max_iters and (_time.time() - start) < budget_s:
+                c = torch.matmul(a, b)
+                if sync is not None:
+                    try:
+                        sync()
+                    except Exception:
+                        sync = None
+                energy += float(c.abs().mean().cpu()) if c.numel() else 0.0
+                a, b = b, c
+                iters += 1
+        except Exception as exc:
+            print(f"[MPS] pump execution failed ({exc}); aborting warm-up")
+            return
+
+        if sync is not None:
+            try:
+                sync()
+            except Exception:
+                pass
+
+    util = energy / max(1, iters)
+    if not _math.isfinite(util):
+        util = 0.0
+    else:
+        util = round(util, 4)
+    total_s = _time.time() - start
+    print(
+        f"[MPS] pump warm-up completed (size={size}, iters={iters}, sec={total_s:.2f}, util~{util}, dtype={dtype_name})"
+    )
+
+
+_AETHER_MPS_PUMP_DISABLED = _aos.environ.get("AETHER_DISABLE_MPS_PUMP", "0") == "1"
+if not _AETHER_MPS_PUMP_DISABLED:
+    _aether_pump_mps()
+
+
 # ---------------------------------------
 # 2) Backward guard (retain_graph retry)
 # ---------------------------------------
