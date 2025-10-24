@@ -1,11 +1,10 @@
-# === AETHER_PATCH_PAGED_ATTEN_AND_GUARDS ===
-"""
-This block adds:
-  1) Safe MPS watermark override (respects user env; no forced clamping)
-  2) Backward guard that retries with retain_graph=True on "second backward" errors
-  3) Light Paged-Attention (windowed) wrapper for inference-time SDPA (Q len = 1)
-Everything else in the file is preserved verbatim.
-"""
+# ============================================================================
+#  SpiralReality Proprietary
+#  Copyright (c) 2025 SpiralReality. All Rights Reserved.
+#
+#  NOTICE: This file is a public-facing version of the Aether orchestration
+#  framework. Core logic and integrated modules are redacted for safety.
+# ============================================================================
 
 import os as _aos
 
