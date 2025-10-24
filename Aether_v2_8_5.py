@@ -1629,6 +1629,13 @@ class TrainConfig:
     oom_retries: int = 3
     grad_scaler: bool = True
     empty_cache_every: int = 0
+    # Data pipeline / host→device controls
+    loader_num_workers: int = 0
+    loader_prefetch_factor: int = 2
+    loader_persistent_workers: bool = False
+    loader_pin_memory: bool = False
+    prefetch_to_device: bool = True
+    disallow_mps_fallback: bool = True
 
 
 class FabricLite:
@@ -2081,6 +2088,24 @@ class AetherTrainerBase:
         if self.scaler is not None:
             print("[AMP] GradScaler(mps) enabled")
 
+        self._prefetch_to_device = (
+            self.device.type == "mps"
+            and bool(getattr(self.cfg, "prefetch_to_device", True))
+        )
+        if self._prefetch_to_device:
+            print("[MPS] host batch prefetch enabled")
+
+        if self.device.type == "mps" and bool(
+            getattr(self.cfg, "disallow_mps_fallback", True)
+        ):
+            try:
+                import torch.backends.mps as _mps_backend
+
+                _mps_backend.fallback_allow_all(False)
+                print("[MPS] CPU fallback disabled (strict MPS kernels)")
+            except Exception as e:
+                print("[MPS] fallback control unavailable:", e)
+
         self._teacher = None
         if (self.cfg.intent_weight > 0.0) or bool(
             getattr(self.cfg, "lvi_enable", False)
@@ -2247,14 +2272,26 @@ class AetherTrainerBase:
 
     def _make_loader(self, ds, shuffle, max_len_for_collate):
         is_iter = isinstance(ds, IterableDataset)
-        return DataLoader(
-            ds,
+        num_workers = max(0, int(getattr(self.cfg, "loader_num_workers", 0)))
+        persistent = (
+            num_workers > 0
+            and bool(getattr(self.cfg, "loader_persistent_workers", False))
+        )
+        pin_memory = bool(getattr(self.cfg, "loader_pin_memory", False))
+        loader_kwargs = dict(
             batch_size=self.cfg.batch_size,
             shuffle=(False if is_iter else bool(shuffle)),
-            num_workers=0,
-            pin_memory=False,
-            persistent_workers=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent,
             collate_fn=lambda b: collate_lm_safe(b, pad_id=self.tok.PAD),
+        )
+        prefetch_factor = getattr(self.cfg, "loader_prefetch_factor", None)
+        if num_workers > 0 and prefetch_factor is not None:
+            loader_kwargs["prefetch_factor"] = max(1, int(prefetch_factor))
+        return DataLoader(
+            ds,
+            **loader_kwargs,
         )
 
     def _ce_loss(
@@ -2398,6 +2435,7 @@ class AetherTrainerMPS(AetherTrainerBase):
                 }
                 oom_count = 0
                 last_oom_err = None
+                bx_cpu, by_cpu = bx, by
 
                 while True:
                     total_loss = 0.0
@@ -2405,13 +2443,50 @@ class AetherTrainerMPS(AetherTrainerBase):
                     accum = 0
                     idx = 0
                     restart_batch = False
+                    batch_on_device = None
+
+                    if self._prefetch_to_device:
+                        try:
+                            batch_on_device = (
+                                bx_cpu.to(self.device, non_blocking=True),
+                                by_cpu.to(self.device, non_blocking=True),
+                            )
+                        except RuntimeError as e:
+                            if self._maybe_handle_oom(e, B * T):
+                                restart_batch = True
+                                oom_count += 1
+                                last_oom_err = e
+                                self.opt.zero_grad(set_to_none=True)
+                                if self._scaler_enabled:
+                                    self.scaler = GradScaler()
+                                    print("[OOM] GradScaler reset after OOM")
+                            else:
+                                print(
+                                    "[MPS] host batch prefetch disabled after error:",
+                                    e,
+                                )
+                                self._prefetch_to_device = False
+                            batch_on_device = None
+
+                    if restart_batch:
+                        if self._oom_retry_limit and oom_count > self._oom_retry_limit:
+                            raise last_oom_err
+                        continue
 
                     while idx < B:
                         current_micro = max(1, int(self._micro_active))
                         chunk_bs = max(1, math.ceil(B / current_micro))
                         end = min(B, idx + chunk_bs)
-                        subx = bx[idx:end].to(self.device, non_blocking=True)
-                        suby = by[idx:end].to(self.device, non_blocking=True)
+                        if batch_on_device is not None:
+                            subx = batch_on_device[0][idx:end]
+                            suby = batch_on_device[1][idx:end]
+                        else:
+                            subx = bx_cpu[idx:end].to(
+                                self.device, non_blocking=True
+                            )
+                            suby = by_cpu[idx:end].to(
+                                self.device, non_blocking=True
+                            )
 
                         # AI pre-forward planning
                         try:
@@ -3198,6 +3273,11 @@ def __aether_main__():
     ap.add_argument("--val_glob", type=str, default="")
     ap.add_argument("--pack_len", type=int, default=1024)
     ap.add_argument("--buffer_size", type=int, default=8192)
+    ap.add_argument("--loader_workers", type=int, default=0)
+    ap.add_argument("--loader_prefetch", type=int, default=2)
+    ap.add_argument("--loader_persistent_workers", action="store_true")
+    ap.add_argument("--loader_pin_memory", action="store_true")
+    ap.add_argument("--no_prefetch_to_device", action="store_true")
     # model
     ap.add_argument("--vocab_size", type=int, default=32000)
     ap.add_argument("--d_model", type=int, default=4096)
@@ -3227,6 +3307,7 @@ def __aether_main__():
     ap.add_argument("--global_tokens", type=int, default=0)
     ap.add_argument("--global_stride", type=int, default=0)
     ap.add_argument("--mps_sync_every", type=int, default=0)
+    ap.add_argument("--allow_mps_cpu_fallback", action="store_true")
     # optimizer
     ap.add_argument("--opt_cpu8bit", action="store_true")
     ap.add_argument("--opt_galore", action="store_true")
@@ -3383,6 +3464,12 @@ def __aether_main__():
         lvi_k=int(args.lvi_k),
         lvi_alpha_mode=str(args.lvi_alpha_mode),
         lvi_every=int(args.lvi_every),
+        loader_num_workers=int(args.loader_workers),
+        loader_prefetch_factor=int(args.loader_prefetch),
+        loader_persistent_workers=bool(args.loader_persistent_workers),
+        loader_pin_memory=bool(args.loader_pin_memory),
+        prefetch_to_device=not bool(args.no_prefetch_to_device),
+        disallow_mps_fallback=not bool(args.allow_mps_cpu_fallback),
     )
     cfg.safetensor_every = int(getattr(args, "safetensor_every", 0))
     cfg.curriculum = [
