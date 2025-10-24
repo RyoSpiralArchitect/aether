@@ -13,12 +13,10 @@
 #   • Intention Contrastive Loss (teacher-positive/negative)
 #   • ReLoRA cycle (periodic merge→re-apply)
 #   • Streaming dataset / Curriculum / TorchScript trace
-# =============================================================================
 # ============================================================================
 
 import os as _aos
 import time as _atime
-
 
 # ---------------------------
 # 1) MPS watermark (safe gate)
@@ -45,9 +43,6 @@ def _aether_patch_mps_watermark():
             print("[MPS] watermark: unlimited requested (allocator untouched)")
             return
         try:
-
-
-
             torch.mps.set_per_process_memory_fraction(r)
             print(f"[MPS] watermark set to {r:.3f}")
         except Exception as e:
@@ -366,8 +361,7 @@ def enable_tiled_sdpa(
     print(
         f"[SDPA] wrapper enabled (window={_AETHER_SDPA_WINDOW}, fp32={compute_in_fp32})"
     )
-
-
+    
 def disable_tiled_sdpa():
     """Restore the original SDPA implementation."""
     global _AETHER_SDPA_ORIG
@@ -1680,7 +1674,6 @@ class AetherPumpSimple(nn.Module):
                         scaling=float(rope_scaling),
                     )
 
-
 # ====== Collate / Datasets ===================================================
 def collate_lm_safe(batch, pad_id: int):
     # batch: List[List[int]]  or  List[Tuple[List[int], List[int]]]
@@ -2594,7 +2587,6 @@ class AetherTrainerBase:
                 self._kb_seq_gains.append(g)
         except Exception:
             pass
-
 
 class AetherTrainerMPS(AetherTrainerBase):
     def __init__(self, *a, ckpt_every: int = 1, **k):
@@ -4857,6 +4849,5 @@ def _install_spiral_guardian_from_env(trainer):
     except Exception as e:
         print("[GUARD] install failed:", e)
         return None
-
 
 # =============================================================================
