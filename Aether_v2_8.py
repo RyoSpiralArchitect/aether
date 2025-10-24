@@ -1472,7 +1472,6 @@ class LinearInt8Base(nn.Module):
 
 
 class LinearInt8LoRA(nn.Module):
-<<<<<<< HEAD:Aether_v2_8_5.py
     def __init__(
         self,
         in_f,
@@ -1482,9 +1481,9 @@ class LinearInt8LoRA(nn.Module):
         dropout: float = 0.0,
         bias: bool = False,
     ):
-=======
+
     def __init__(self, in_f, out_f, r=160, alpha=320, dropout=0.0, bias=False):
->>>>>>> origin/main:Aether_v2_8.py
+        origin/main:Aether_v2_8.py
         super().__init__()
         self.base = LinearInt8Base(in_f, out_f, bias=bias)
         self.lora_A = nn.Linear(in_f, r, bias=False)
