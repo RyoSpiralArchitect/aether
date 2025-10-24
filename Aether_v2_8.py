@@ -4,6 +4,16 @@
 #
 #  NOTICE: This file is a public-facing version of the Aether orchestration
 #  framework. Core logic and integrated modules are redacted for safety.
+# Aether v2.8 – (MPS-first; M4 optimized, stable core)
+#   • SDPA: Tiled + Sliding Window + Global tokens (online softmax, MPS-safe)
+#   • GQA/MQA: kv_heads for K/V head sharing
+#   • INT8-base + LoRA (custom) / PEFT-LoRA / Hybrid
+#   • CPU-AdamW(8bit-ish) optional
+#   • LVI (light): teacher-based Z-bias + low-frequency cache
+#   • Intention Contrastive Loss (teacher-positive/negative)
+#   • ReLoRA cycle (periodic merge→re-apply)
+#   • Streaming dataset / Curriculum / TorchScript trace
+# =============================================================================
 # ============================================================================
 
 import os as _aos
@@ -369,24 +379,6 @@ def disable_tiled_sdpa():
             print("[SDPA] wrapper disabled")
     finally:
         _AETHER_SDPA_ORIG = None
-
-
-# === END AETHER_PATCH_PAGED_ATTEN_AND_GUARDS ===
-# =============================================================================
-# SpiralReality Proprietary – LicenseRef-SpiralReality-Proprietary
-# SPDX-License-Identifier: LicenseRef-SpiralReality-Proprietary
-# © 2025 SpiralReality（Ryō ∴ SpiralArchitect + collaborators）All rights reserved.
-#
-# Aether v2.8 – (MPS-only; M4 optimized, stable core)
-#   • SDPA: Tiled + Sliding Window + Global tokens (online softmax, MPS-safe)
-#   • GQA/MQA: kv_heads for K/V head sharing
-#   • INT8-base + LoRA (custom) / PEFT-LoRA / Hybrid
-#   • CPU-AdamW(8bit-ish) optional
-#   • LVI (light): teacher-based Z-bias + low-frequency cache
-#   • Intention Contrastive Loss (teacher-positive/negative)
-#   • ReLoRA cycle (periodic merge→re-apply)
-#   • Streaming dataset / Curriculum / TorchScript trace
-# =============================================================================
 
 import os
 import time
