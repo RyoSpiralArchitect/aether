@@ -18,6 +18,7 @@
 import os as _aos
 import time as _atime
 
+
 # ---------------------------
 # 1) MPS watermark (safe gate)
 # ---------------------------
@@ -387,6 +388,171 @@ import numpy as np
 
 import torch
 from torch.amp import GradScaler
+
+
+def _aether_detect_mps() -> bool:
+    try:
+        backend = getattr(torch, "backends", None)
+        if backend is None:
+            return False
+        mps = getattr(torch.backends, "mps", None)
+        if mps is None:
+            return False
+        return bool(mps.is_available())
+    except Exception:
+        return False
+
+
+_AETHER_MPS_AVAILABLE = _aether_detect_mps()
+_AETHER_DEFAULT_LORA_R = int(
+    _aos.environ.get(
+        "AETHER_LORA_R",
+        "160" if _AETHER_MPS_AVAILABLE else "16",
+    )
+)
+
+
+class FlashAttentionRuntime:
+    def __init__(self):
+        self._eps = 1e-6
+
+    def _block_sizes(self):
+        bq = max(1, int(_aos.environ.get("AETHER_FLASH_BLOCK_Q", "128")))
+        bk = max(1, int(_aos.environ.get("AETHER_FLASH_BLOCK_K", "256")))
+        return bq, bk
+
+    def should_use(self, q: torch.Tensor) -> bool:
+        if _aos.environ.get("AETHER_FLASH_DISABLE", "0") == "1":
+            return False
+        if not _AETHER_MPS_AVAILABLE:
+            return False
+        if q.device.type != "mps":
+            return False
+        return True
+
+    def _slice_mask(self, mask: torch.Tensor, i0: int, i1: int, j0: int, j1: int):
+        if mask is None:
+            return None
+        if mask.dim() == 4:
+            return mask[:, :, i0:i1, j0:j1]
+        if mask.dim() == 3:
+            return mask[:, i0:i1, j0:j1].unsqueeze(1)
+        if mask.dim() == 2:
+            blk = mask[:, j0:j1]
+            return blk.view(blk.shape[0], 1, 1, blk.shape[1]).expand(
+                -1, 1, i1 - i0, -1
+            )
+        return None
+
+    def _pad_mask_slice(
+        self,
+        pad_mask: Optional[torch.Tensor],
+        i0: int,
+        i1: int,
+        j0: int,
+        j1: int,
+        device: torch.device,
+    ):
+        if pad_mask is None:
+            return None
+        if pad_mask.dtype != torch.bool:
+            pad_mask = pad_mask.to(torch.bool)
+        key_valid = pad_mask[:, j0:j1]
+        if key_valid.numel() == 0:
+            return None
+        key_block = (~key_valid).view(key_valid.shape[0], 1, 1, key_valid.shape[1])
+        return key_block.expand(-1, 1, i1 - i0, -1).to(device)
+
+    def __call__(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        pad_mask: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
+        dropout_p: float = 0.0,
+        is_causal: bool = True,
+        training: bool = False,
+    ) -> torch.Tensor:
+        B, H, T, D = q.shape
+        block_q, block_k = self._block_sizes()
+        out = torch.zeros_like(q)
+        scale = 1.0 / math.sqrt(max(1, D))
+        eps = float(_aos.environ.get("AETHER_FLASH_EPS", self._eps))
+        for i0 in range(0, T, block_q):
+            i1 = min(i0 + block_q, T)
+            q_blk = q[:, :, i0:i1, :]
+            q_pos = None
+            if is_causal:
+                q_pos = torch.arange(i0, i1, device=q.device)
+            m_i = torch.full(
+                (B, H, i1 - i0), float("-inf"), dtype=torch.float32, device=q.device
+            )
+            l_i = torch.zeros((B, H, i1 - i0), dtype=torch.float32, device=q.device)
+            o_i = torch.zeros((B, H, i1 - i0, D), dtype=q.dtype, device=q.device)
+            for j0 in range(0, T, block_k):
+                j1 = min(j0 + block_k, T)
+                scores = torch.einsum(
+                    "bhqd,bhkd->bhqk", q_blk, k[:, :, j0:j1, :]
+                ).to(torch.float32)
+                scores.mul_(scale)
+                mask_block = None
+                if attn_mask is not None:
+                    mask_block = self._slice_mask(attn_mask, i0, i1, j0, j1)
+                if mask_block is None:
+                    mask_block = self._pad_mask_slice(
+                        pad_mask, i0, i1, j0, j1, scores.device
+                    )
+                if mask_block is not None:
+                    if mask_block.dtype == torch.bool:
+                        scores = scores.masked_fill(mask_block, float("-inf"))
+                    else:
+                        scores = scores + mask_block.to(scores.dtype)
+                if is_causal:
+                    if q_pos is None:
+                        q_pos = torch.arange(i0, i1, device=q.device)
+                    k_pos = torch.arange(j0, j1, device=q.device)
+                    causal = k_pos.view(1, 1, 1, -1) > q_pos.view(1, 1, -1, 1)
+                    scores = scores.masked_fill(causal, float("-inf"))
+                block_max = torch.max(scores, dim=-1).values
+                block_max = torch.where(
+                    torch.isfinite(block_max),
+                    block_max,
+                    torch.full_like(block_max, -1e9),
+                )
+                m_new = torch.maximum(m_i, block_max)
+                scores = scores - m_new.unsqueeze(-1)
+                scores = torch.where(
+                    torch.isfinite(scores),
+                    scores,
+                    torch.full_like(scores, -1e9),
+                )
+                p = torch.exp(scores)
+                if training and dropout_p > 0.0:
+                    keep = torch.rand_like(p)
+                    p = p * (keep > dropout_p) / max(1e-6, 1.0 - dropout_p)
+                exp_m = torch.exp(m_i - m_new)
+                l_i = exp_m * l_i + p.sum(dim=-1)
+                o_i = (
+                    exp_m.unsqueeze(-1).to(q.dtype) * o_i
+                    + torch.einsum(
+                        "bhqk,bhkd->bhqd", p.to(q.dtype), v[:, :, j0:j1, :]
+                    )
+                )
+                m_i = m_new
+            denom = l_i.clamp_min(eps).unsqueeze(-1).to(q.dtype)
+            o_blk = o_i / denom
+            if pad_mask is not None:
+                valid = pad_mask[:, i0:i1]
+                if valid.dtype != torch.bool:
+                    valid = valid.to(torch.bool)
+                o_blk = o_blk * valid.view(B, 1, i1 - i0, 1)
+            out[:, :, i0:i1, :] = o_blk
+        return out
+
+
+_FLASH_ATTENTION = FlashAttentionRuntime()
 
 
 # === Aether injected: GaLore-like low-rank optimizer (matrix params only) ==============
@@ -1306,7 +1472,19 @@ class LinearInt8Base(nn.Module):
 
 
 class LinearInt8LoRA(nn.Module):
+<<<<<<< HEAD:Aether_v2_8_5.py
+    def __init__(
+        self,
+        in_f,
+        out_f,
+        r: int = _AETHER_DEFAULT_LORA_R,
+        alpha: int = 32,
+        dropout: float = 0.0,
+        bias: bool = False,
+    ):
+=======
     def __init__(self, in_f, out_f, r=160, alpha=320, dropout=0.0, bias=False):
+>>>>>>> origin/main:Aether_v2_8.py
         super().__init__()
         self.base = LinearInt8Base(in_f, out_f, bias=bias)
         self.lora_A = nn.Linear(in_f, r, bias=False)
@@ -1529,17 +1707,30 @@ class MHA(nn.Module):
                 q = q[..., : self.dk]
                 k = k[..., : self.dk]
 
-        m = None
-        if pad_mask is not None:
-            m = (~pad_mask).unsqueeze(1).unsqueeze(2).expand(B, 1, T, T)
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=m if attn_mask is None else attn_mask,
-            dropout_p=self.drop.p if self.training else 0.0,
-            is_causal=is_causal,
-        )
+        attn_dropout = self.drop.p if self.training else 0.0
+        if _FLASH_ATTENTION.should_use(q):
+            y = _FLASH_ATTENTION(
+                q,
+                k,
+                v,
+                pad_mask=pad_mask,
+                attn_mask=attn_mask,
+                dropout_p=attn_dropout,
+                is_causal=is_causal,
+                training=self.training,
+            )
+        else:
+            m = None
+            if pad_mask is not None:
+                m = (~pad_mask).unsqueeze(1).unsqueeze(2).expand(B, 1, T, T)
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask if attn_mask is not None else m,
+                dropout_p=attn_dropout,
+                is_causal=is_causal,
+            )
         y = y.permute(0, 2, 1, 3).contiguous().view(B, T, D)
         return self.drop(self.proj(y))
 
@@ -1817,6 +2008,9 @@ class TrainConfig:
     # ReLoRA
     relora_every: int = 0
 
+    # LoRA default rank
+    lora_r: int = _AETHER_DEFAULT_LORA_R
+
     # GaLore-like optimizer
     opt_galore: bool = False
     galore_rank: int = 64
@@ -1960,8 +2154,13 @@ except Exception:
 
 def apply_peft_lora(
     model: nn.Module,
+<<<<<<< HEAD:Aether_v2_8_5.py
+    r: int = _AETHER_DEFAULT_LORA_R,
+    alpha: int = 32,
+=======
     r: int = 160,
     alpha: int = 320,
+>>>>>>> origin/main:Aether_v2_8.py
     dropout: float = 0.05,
     targets: Optional[List[str]] = None,
 ) -> nn.Module:
@@ -3588,8 +3787,18 @@ def __aether_main__():
     ap.add_argument(
         "--hybrid_lora", action="store_true", help="PEFT + INT8-LoRA hybrid"
     )
+<<<<<<< HEAD:Aether_v2_8_5.py
+    ap.add_argument(
+        "--lora_r",
+        type=int,
+        default=_AETHER_DEFAULT_LORA_R,
+        help=f"LoRA rank (default: {_AETHER_DEFAULT_LORA_R})",
+    )
+    ap.add_argument("--lora_alpha", type=int, default=32)
+=======
     ap.add_argument("--lora_r", type=int, default=160)
     ap.add_argument("--lora_alpha", type=int, default=320)
+>>>>>>> origin/main:Aether_v2_8.py
     ap.add_argument("--lora_dropout", type=float, default=0.05)
     ap.add_argument("--save_adapter", type=str, default="")
     # tracing
