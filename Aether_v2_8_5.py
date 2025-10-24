@@ -808,6 +808,156 @@ except Exception:
         return "cpu"
 
 
+def _aether__sync_device(device):
+    try:
+        import torch
+
+        if device.type == "mps" and hasattr(torch, "mps"):
+            sync = getattr(torch.mps, "synchronize", None)
+            if sync is not None:
+                sync()
+        elif device.type == "cuda" and torch.cuda.is_available():
+            idx = getattr(device, "index", None)
+            if idx is None:
+                torch.cuda.synchronize()
+            else:
+                torch.cuda.synchronize(idx)
+    except Exception:
+        pass
+
+
+def _aether_builtin_gpu_pump(device, dtype, seconds, iters, matrix):
+    import torch
+
+    seconds = max(0.0, float(seconds))
+    iters = max(0, int(iters))
+    matrix = max(32, int(matrix))
+    start = time.time()
+    deadline = start + seconds if seconds > 0 else None
+    total = 0
+    elapsed = 0.0
+
+    allowed = {torch.float16, torch.float32, torch.bfloat16}
+    if dtype not in allowed:
+        dtype = torch.float16 if device.type == "mps" else torch.float32
+    try:
+        torch.zeros(1, device=device, dtype=dtype)
+    except Exception:
+        dtype = torch.float16 if device.type == "mps" else torch.float32
+
+    with torch.no_grad():
+        a = torch.randn((matrix, matrix), device=device, dtype=dtype)
+        b = torch.randn((matrix, matrix), device=device, dtype=dtype)
+        while True:
+            a = torch.mm(a, b)
+            total += 1
+            _aether__sync_device(device)
+            if iters and total >= iters:
+                break
+            if deadline is not None and time.time() >= deadline:
+                break
+        del a, b
+    _aether__sync_device(device)
+    elapsed = time.time() - start
+    return total, elapsed, dtype
+
+
+def _aether_gpu_pump(
+    device,
+    dtype=None,
+    seconds: float = 0.0,
+    iters: int = 0,
+    matrix: int = 2048,
+    backend: str = "auto",
+):
+    """Warm up the GPU/MPS device by issuing heavy matmuls."""
+
+    if device is None or device.type not in ("mps", "cuda"):
+        return False
+
+    seconds = max(0.0, float(seconds))
+    iters = max(0, int(iters))
+    matrix = max(32, int(matrix))
+    if seconds <= 0.0 and iters <= 0:
+        return False
+
+    import torch
+
+    if dtype is None:
+        dtype = torch.float16 if device.type == "mps" else torch.float32
+
+    backend = (backend or "auto").strip().lower()
+    used_backend = None
+    total = 0
+    elapsed = 0.0
+
+    if SpiralPumpEngine is not None:
+        try:
+            target_backend = backend
+            if target_backend == "auto":
+                target_backend = str(pump_detect_backend()).lower()
+            engine = None
+            try:
+                engine = SpiralPumpEngine(backend=target_backend, device=str(device))
+            except TypeError:
+                engine = SpiralPumpEngine(backend=target_backend)
+            except Exception:
+                engine = SpiralPumpEngine()
+            run = None
+            if engine is not None:
+                run = getattr(engine, "pump", None) or getattr(engine, "run", None)
+            if run is not None:
+                kwargs = {}
+                if seconds > 0:
+                    kwargs["seconds"] = float(seconds)
+                if iters > 0:
+                    kwargs["iterations"] = int(iters)
+                if matrix > 0:
+                    kwargs["matrix"] = int(matrix)
+                try:
+                    kw_dtype = getattr(dtype, "name", None) or str(dtype)
+                    if kw_dtype:
+                        kwargs["dtype"] = kw_dtype
+                except Exception:
+                    pass
+                try:
+                    result = run(**kwargs)
+                    used_backend = f"external:{target_backend}"
+                    if isinstance(result, dict):
+                        if "iterations" in result:
+                            total = int(result["iterations"])
+                        if "seconds" in result:
+                            try:
+                                elapsed = float(result["seconds"])
+                            except Exception:
+                                pass
+                    elif isinstance(result, int):
+                        total = result
+                    elif isinstance(result, float):
+                        elapsed = float(result)
+                except Exception as e:
+                    print("[PUMP] external engine failed:", e)
+                    used_backend = None
+        except Exception as e:
+            print("[PUMP] external engine init failed:", e)
+            used_backend = None
+
+    if used_backend is None:
+        total, elapsed, dtype = _aether_builtin_gpu_pump(
+            device, dtype, seconds, iters, matrix
+        )
+        used_backend = f"builtin:{device.type}"
+    else:
+        if elapsed <= 0.0:
+            elapsed = max(seconds, 0.0)
+
+    print(
+        f"[PUMP] warmup complete (backend={used_backend}, steps={total}, "
+        f"matrix={matrix}, dtype={dtype}, elapsed={elapsed:.2f}s)"
+    )
+    return True
+
+
 #
 # ====== Gradient Checkpointing (MPS-safe) ====================================
 def enable_gradient_checkpointing(model, every: int = 1):
@@ -1628,6 +1778,11 @@ class TrainConfig:
     oom_retries: int = 3
     grad_scaler: bool = True
     empty_cache_every: int = 0
+    pump_seconds: float = 0.0
+    pump_iters: int = 0
+    pump_matrix: int = 2048
+    pump_backend: str = "auto"
+    pump_on_init: bool = True
     # Data pipeline / host→device controls
     loader_num_workers: int = 0
     loader_prefetch_factor: int = 2
@@ -2079,6 +2234,52 @@ class AetherTrainerBase:
 
         if not hasattr(self, "amp_dtype"):
             self.amp_dtype = torch.float16
+
+        pump_seconds = float(getattr(self.cfg, "pump_seconds", 0.0) or 0.0)
+        pump_iters = int(getattr(self.cfg, "pump_iters", 0) or 0)
+        pump_matrix = int(getattr(self.cfg, "pump_matrix", 2048) or 0)
+        pump_backend = str(getattr(self.cfg, "pump_backend", "auto") or "auto")
+        pump_on_init = bool(getattr(self.cfg, "pump_on_init", True))
+
+        env_seconds = os.environ.get("AETHER_PUMP_SECONDS")
+        if env_seconds is not None:
+            try:
+                pump_seconds = float(env_seconds)
+            except Exception:
+                pass
+        env_iters = os.environ.get("AETHER_PUMP_ITERS")
+        if env_iters is not None:
+            try:
+                pump_iters = int(env_iters)
+            except Exception:
+                pass
+        env_matrix = os.environ.get("AETHER_PUMP_MATRIX")
+        if env_matrix is not None:
+            try:
+                pump_matrix = int(env_matrix)
+            except Exception:
+                pass
+        env_backend = os.environ.get("AETHER_PUMP_BACKEND")
+        if env_backend:
+            pump_backend = str(env_backend)
+        env_on_init = os.environ.get("AETHER_PUMP_ON_INIT")
+        if env_on_init is not None:
+            pump_on_init = str(env_on_init).strip().lower() not in (
+                "0",
+                "false",
+                "no",
+                "off",
+            )
+
+        if pump_on_init and (pump_seconds > 0.0 or pump_iters > 0):
+            _aether_gpu_pump(
+                self.device,
+                dtype=self.amp_dtype,
+                seconds=pump_seconds,
+                iters=pump_iters,
+                matrix=pump_matrix,
+                backend=pump_backend,
+            )
 
         self._scaler_enabled = self.device.type == "mps" and bool(
             getattr(self.cfg, "grad_scaler", True)
@@ -3307,6 +3508,10 @@ def __aether_main__():
     ap.add_argument("--global_stride", type=int, default=0)
     ap.add_argument("--mps_sync_every", type=int, default=0)
     ap.add_argument("--allow_mps_cpu_fallback", action="store_true")
+    ap.add_argument("--pump_seconds", type=float, default=0.0)
+    ap.add_argument("--pump_iters", type=int, default=0)
+    ap.add_argument("--pump_matrix", type=int, default=2048)
+    ap.add_argument("--pump_backend", type=str, default="auto")
     # optimizer
     ap.add_argument("--opt_cpu8bit", action="store_true")
     ap.add_argument("--opt_galore", action="store_true")
@@ -3469,6 +3674,10 @@ def __aether_main__():
         loader_pin_memory=bool(args.loader_pin_memory),
         prefetch_to_device=not bool(args.no_prefetch_to_device),
         disallow_mps_fallback=not bool(args.allow_mps_cpu_fallback),
+        pump_seconds=float(args.pump_seconds),
+        pump_iters=int(args.pump_iters),
+        pump_matrix=int(args.pump_matrix),
+        pump_backend=str(args.pump_backend),
     )
     cfg.safetensor_every = int(getattr(args, "safetensor_every", 0))
     cfg.curriculum = [
