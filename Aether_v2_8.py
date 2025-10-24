@@ -4,6 +4,15 @@
 #
 #  NOTICE: This file is a public-facing version of the Aether orchestration
 #  framework. Core logic and integrated modules are redacted for safety.
+# Aether v2.8 – (MPS-first; M4 optimized, stable core)
+#   • SDPA: Tiled + Sliding Window + Global tokens (online softmax, MPS-safe)
+#   • GQA/MQA: kv_heads for K/V head sharing
+#   • INT8-base + LoRA (custom) / PEFT-LoRA / Hybrid
+#   • CPU-AdamW(8bit-ish) optional
+#   • LVI (light): teacher-based Z-bias + low-frequency cache
+#   • Intention Contrastive Loss (teacher-positive/negative)
+#   • ReLoRA cycle (periodic merge→re-apply)
+#   • Streaming dataset / Curriculum / TorchScript trace
 # ============================================================================
 
 import os as _aos
@@ -35,9 +44,6 @@ def _aether_patch_mps_watermark():
             print("[MPS] watermark: unlimited requested (allocator untouched)")
             return
         try:
-
-
-
             torch.mps.set_per_process_memory_fraction(r)
             print(f"[MPS] watermark set to {r:.3f}")
         except Exception as e:
@@ -356,8 +362,7 @@ def enable_tiled_sdpa(
     print(
         f"[SDPA] wrapper enabled (window={_AETHER_SDPA_WINDOW}, fp32={compute_in_fp32})"
     )
-
-
+    
 def disable_tiled_sdpa():
     """Restore the original SDPA implementation."""
     global _AETHER_SDPA_ORIG
@@ -369,24 +374,6 @@ def disable_tiled_sdpa():
             print("[SDPA] wrapper disabled")
     finally:
         _AETHER_SDPA_ORIG = None
-
-
-# === END AETHER_PATCH_PAGED_ATTEN_AND_GUARDS ===
-# =============================================================================
-# SpiralReality Proprietary – LicenseRef-SpiralReality-Proprietary
-# SPDX-License-Identifier: LicenseRef-SpiralReality-Proprietary
-# © 2025 SpiralReality（Ryō ∴ SpiralArchitect + collaborators）All rights reserved.
-#
-# Aether v2.8 – (MPS-only; M4 optimized, stable core)
-#   • SDPA: Tiled + Sliding Window + Global tokens (online softmax, MPS-safe)
-#   • GQA/MQA: kv_heads for K/V head sharing
-#   • INT8-base + LoRA (custom) / PEFT-LoRA / Hybrid
-#   • CPU-AdamW(8bit-ish) optional
-#   • LVI (light): teacher-based Z-bias + low-frequency cache
-#   • Intention Contrastive Loss (teacher-positive/negative)
-#   • ReLoRA cycle (periodic merge→re-apply)
-#   • Streaming dataset / Curriculum / TorchScript trace
-# =============================================================================
 
 import os
 import time
@@ -1218,14 +1205,21 @@ def zero_nan_(t: torch.Tensor):
 
 # ====== Tiled SDPA (replace F.sdpa) =========================================
 _ORIG_SDPA = F.scaled_dot_product_attention
+_DEFAULT_TILE_Q = int(os.environ.get("AETHER_MPS_FLASH_TILE_Q", "192"))
+_DEFAULT_TILE_K = int(os.environ.get("AETHER_MPS_FLASH_TILE_K", "320"))
+_DEFAULT_FLASH_FP32 = os.environ.get("AETHER_MPS_FLASH_FP32", "1") != "0"
+_DEFAULT_WINDOW = int(os.environ.get("AETHER_MPS_FLASH_WINDOW", "0"))
+_DEFAULT_GLOBAL_TOKENS = int(os.environ.get("AETHER_MPS_FLASH_GLOBALS", "0"))
+_DEFAULT_GLOBAL_STRIDE = int(os.environ.get("AETHER_MPS_FLASH_STRIDE", "0"))
+
 _PATCHED_SDPA = {
     "on": False,
-    "tile_q": 128,
-    "tile_k": 256,
-    "fp32": True,
-    "window": 0,  # 0=OFF, >0: local band (past window only)
-    "global_tokens": 0,  # always-allowed keys from head
-    "global_stride": 0,  # evenly spaced globals (0=off)
+    "tile_q": max(16, _DEFAULT_TILE_Q),
+    "tile_k": max(32, _DEFAULT_TILE_K),
+    "fp32": bool(_DEFAULT_FLASH_FP32),
+    "window": max(0, _DEFAULT_WINDOW),  # 0=OFF, >0: local band (past window only)
+    "global_tokens": max(0, _DEFAULT_GLOBAL_TOKENS),  # always-allowed keys from head
+    "global_stride": max(0, _DEFAULT_GLOBAL_STRIDE),  # evenly spaced globals (0=off)
 }
 
 
@@ -1255,8 +1249,8 @@ def streaming_sdpa_mps(
     attn_mask=None,
     dropout_p=0.0,
     is_causal=False,
-    tile_q=128,
-    tile_k=256,
+    tile_q=192,
+    tile_k=320,
     compute_in_fp32=True,
     window_size: int = 0,
     global_tokens: int = 0,
@@ -1371,7 +1365,7 @@ def _patched_sdpa(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, scale
     )
 
 
-def enable_tiled_sdpa(tile_q=128, tile_k=256, compute_in_fp32=True):
+def enable_tiled_sdpa(tile_q=192, tile_k=320, compute_in_fp32=True):
     if not _PATCHED_SDPA["on"]:
         setattr(F, "scaled_dot_product_attention", _patched_sdpa)
         _PATCHED_SDPA["on"] = True
@@ -1390,6 +1384,45 @@ def disable_tiled_sdpa():
     if _PATCHED_SDPA["on"]:
         setattr(F, "scaled_dot_product_attention", _ORIG_SDPA)
         _PATCHED_SDPA["on"] = False
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return int(default)
+    try:
+        return int(raw)
+    except Exception:
+        print(f"[ENV] invalid int for {name}={raw!r}; using {default}")
+        return int(default)
+
+
+def _auto_enable_mps_flash_attention():
+    if os.environ.get("AETHER_DISABLE_MPS_FLASH", "0") == "1":
+        return
+    try:
+        import torch
+
+        if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+            return
+    except Exception:
+        return
+
+    tile_q = max(16, _env_int("AETHER_MPS_FLASH_TILE_Q", _PATCHED_SDPA["tile_q"]))
+    tile_k = max(32, _env_int("AETHER_MPS_FLASH_TILE_K", _PATCHED_SDPA["tile_k"]))
+    fp32 = os.environ.get("AETHER_MPS_FLASH_FP32", "1") != "0"
+    enable_tiled_sdpa(tile_q=tile_q, tile_k=tile_k, compute_in_fp32=fp32)
+    window = _env_int("AETHER_MPS_FLASH_WINDOW", _PATCHED_SDPA["window"])
+    globals_n = _env_int("AETHER_MPS_FLASH_GLOBALS", _PATCHED_SDPA["global_tokens"])
+    stride = _env_int("AETHER_MPS_FLASH_STRIDE", _PATCHED_SDPA["global_stride"])
+    if window > 0 or globals_n > 0 or stride > 0:
+        set_sliding_window(window, globals_n, stride)
+    print(
+        f"[MPS][FLASH] enabled streaming attention (tile_q={tile_q}, tile_k={tile_k}, window={window}, globals={globals_n}, stride={stride})"
+    )
+
+
+_auto_enable_mps_flash_attention()
 
 
 # ====== INT8 base + LoRA (custom; PEFT排他側で利用) ==========================
@@ -1439,6 +1472,7 @@ class LinearInt8Base(nn.Module):
 
 
 class LinearInt8LoRA(nn.Module):
+<<<<<<< HEAD:Aether_v2_8_5.py
     def __init__(
         self,
         in_f,
@@ -1448,6 +1482,9 @@ class LinearInt8LoRA(nn.Module):
         dropout: float = 0.0,
         bias: bool = False,
     ):
+=======
+    def __init__(self, in_f, out_f, r=160, alpha=320, dropout=0.0, bias=False):
+>>>>>>> origin/main:Aether_v2_8.py
         super().__init__()
         self.base = LinearInt8Base(in_f, out_f, bias=bias)
         self.lora_A = nn.Linear(in_f, r, bias=False)
@@ -1463,8 +1500,8 @@ class LinearInt8LoRA(nn.Module):
 
 def convert_linear_to_int8_lora(
     model: nn.Module,
-    r: int = _AETHER_DEFAULT_LORA_R,
-    alpha: int = 32,
+    r: int = 160,
+    alpha: int = 320,
     dropout: float = 0.0,
     include_names: Optional[List[str]] = None,
     exclude_names: Tuple[str, ...] = ("emb", "head"),
@@ -1828,7 +1865,6 @@ class AetherPumpSimple(nn.Module):
                         scaling=float(rope_scaling),
                     )
 
-
 # ====== Collate / Datasets ===================================================
 def collate_lm_safe(batch, pad_id: int):
     # batch: List[List[int]]  or  List[Tuple[List[int], List[int]]]
@@ -1948,8 +1984,8 @@ class TrainConfig:
     byte_noise: float = 0.0
     span_mask_prob: float = 0.02
     span_mask_len: int = 8
-    tiled_q: int = 128
-    tiled_k: int = 256
+    tiled_q: int = 192
+    tiled_k: int = 320
     mps_sync_every: int = 0
     # LVI regs / switches
     lvi_mv_weight: float = 0.10
@@ -2118,8 +2154,13 @@ except Exception:
 
 def apply_peft_lora(
     model: nn.Module,
+<<<<<<< HEAD:Aether_v2_8_5.py
     r: int = _AETHER_DEFAULT_LORA_R,
     alpha: int = 32,
+=======
+    r: int = 160,
+    alpha: int = 320,
+>>>>>>> origin/main:Aether_v2_8.py
     dropout: float = 0.05,
     targets: Optional[List[str]] = None,
 ) -> nn.Module:
@@ -2161,8 +2202,8 @@ def apply_hybrid_lora(
     model: nn.Module,
     peft_targets: List[str],
     int8_include: Optional[List[str]],
-    r: int = _AETHER_DEFAULT_LORA_R,
-    alpha: int = 32,
+    r: int = 160,
+    alpha: int = 320,
     dropout: float = 0.05,
 ) -> nn.Module:
     if not PEFT_AVAILABLE:
@@ -2655,8 +2696,8 @@ class AetherTrainerBase:
             ]
             self.model = apply_peft_lora(
                 self.model,
-                r=int(getattr(self.cfg, "lora_r", _AETHER_DEFAULT_LORA_R)),
-                alpha=int(getattr(self.cfg, "lora_alpha", 32)),
+                r=int(getattr(self.cfg, "lora_r", 160)),
+                alpha=int(getattr(self.cfg, "lora_alpha", 320)),
                 dropout=float(getattr(self.cfg, "lora_dropout", 0.05)),
                 targets=targets,
             ).to(self.device)
@@ -2745,7 +2786,6 @@ class AetherTrainerBase:
                 self._kb_seq_gains.append(g)
         except Exception:
             pass
-
 
 class AetherTrainerMPS(AetherTrainerBase):
     def __init__(self, *a, ckpt_every: int = 1, **k):
@@ -3712,8 +3752,8 @@ def __aether_main__():
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--warmup", type=int, default=300)
     ap.add_argument("--out_dir", type=str, default="runs/v28")
-    ap.add_argument("--tiled_q", type=int, default=128)
-    ap.add_argument("--tiled_k", type=int, default=256)
+    ap.add_argument("--tiled_q", type=int, default=192)
+    ap.add_argument("--tiled_k", type=int, default=320)
     # attention window
     ap.add_argument("--window_size", type=int, default=0)
     ap.add_argument("--global_tokens", type=int, default=0)
@@ -3747,6 +3787,7 @@ def __aether_main__():
     ap.add_argument(
         "--hybrid_lora", action="store_true", help="PEFT + INT8-LoRA hybrid"
     )
+<<<<<<< HEAD:Aether_v2_8_5.py
     ap.add_argument(
         "--lora_r",
         type=int,
@@ -3754,6 +3795,10 @@ def __aether_main__():
         help=f"LoRA rank (default: {_AETHER_DEFAULT_LORA_R})",
     )
     ap.add_argument("--lora_alpha", type=int, default=32)
+=======
+    ap.add_argument("--lora_r", type=int, default=160)
+    ap.add_argument("--lora_alpha", type=int, default=320)
+>>>>>>> origin/main:Aether_v2_8.py
     ap.add_argument("--lora_dropout", type=float, default=0.05)
     ap.add_argument("--save_adapter", type=str, default="")
     # tracing
@@ -5013,6 +5058,5 @@ def _install_spiral_guardian_from_env(trainer):
     except Exception as e:
         print("[GUARD] install failed:", e)
         return None
-
 
 # =============================================================================
