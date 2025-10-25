@@ -7,6 +7,7 @@
 # ============================================================================
 
 import os as _aos
+import time as _atime
 
 
 # ---------------------------
@@ -48,6 +49,442 @@ def _aether_patch_mps_watermark():
 
 if _aos.environ.get("AETHER_DISABLE_MPS_WM_PATCH", "0") != "1":
     _aether_patch_mps_watermark()
+
+
+# -----------------------------
+# 1a) MPS fast-path preferences
+# -----------------------------
+def _aether_mps_fastpath():
+    try:
+        import torch
+    except Exception:
+        return
+
+    if not hasattr(torch, "mps"):
+        return
+
+    backend = getattr(torch.backends, "mps", None)
+    if backend is None:
+        return
+    try:
+        if not backend.is_available():
+            return
+    except Exception:
+        return
+
+    if _aos.environ.get("AETHER_MPS_ASYNC", "1") != "0":
+        setter = getattr(torch.mps, "set_graphs_sync_enabled", None)
+        if setter is not None:
+            try:
+                setter(False)
+                print("[MPS] async graph execution enabled")
+            except Exception as e:
+                print("[MPS] async graph execution toggle failed:", e)
+
+
+if _aos.environ.get("AETHER_DISABLE_MPS_FASTPATH", "0") != "1":
+    _aether_mps_fastpath()
+
+
+# ------------------------------
+# 1b) MPS warmup (pump & preheat)
+# ------------------------------
+def _aether_mps_warmup():
+    auto_enable = _aos.environ.get("AETHER_MPS_WARMUP_AUTO", "1") != "0"
+    steps_s = _aos.environ.get("AETHER_MPS_WARMUP_STEPS")
+    if steps_s is None:
+        if not auto_enable:
+            return
+        steps = 3
+    else:
+        try:
+            steps = int(steps_s)
+        except Exception:
+            print(f"[MPS] Invalid AETHER_MPS_WARMUP_STEPS={steps_s!r}; ignoring")
+            return
+
+    if steps <= 0:
+        return
+
+    size_s = _aos.environ.get("AETHER_MPS_WARMUP_SIZE", "2048")
+    try:
+        size = int(size_s)
+    except Exception:
+        print(f"[MPS] Invalid AETHER_MPS_WARMUP_SIZE={size_s!r}; using 2048")
+        size = 2048
+
+    dtype_name = _aos.environ.get("AETHER_MPS_WARMUP_DTYPE", "float16").lower()
+
+    try:
+        import torch
+    except Exception:
+        return
+
+    try:
+        import torch.nn.functional as F
+    except Exception:
+        F = None
+
+    if not hasattr(torch, "mps"):
+        return
+
+    backend = getattr(torch, "backends", None)
+    if backend is not None and hasattr(torch.backends, "mps"):
+        try:
+            if not torch.backends.mps.is_available():
+                return
+        except Exception:
+            return
+
+    dtype_map = {
+        "float16": torch.float16,
+        "half": torch.float16,
+        "float32": torch.float32,
+        "float": torch.float32,
+        "bfloat16": getattr(torch, "bfloat16", torch.float16),
+    }
+    dtype = dtype_map.get(dtype_name)
+    if dtype is None:
+        print(f"[MPS] Unknown dtype {dtype_name!r}; defaulting to float16")
+        dtype = torch.float16
+
+    sync = _aos.environ.get("AETHER_MPS_WARMUP_SYNC", "1") != "0"
+    attn_enable = _aos.environ.get("AETHER_MPS_WARMUP_ATTENTION", "1") != "0"
+    attn_steps_env = _aos.environ.get("AETHER_MPS_WARMUP_ATTENTION_STEPS")
+    attn_heads = max(1, int(_aos.environ.get("AETHER_MPS_WARMUP_HEADS", "16")))
+    attn_seq = max(1, int(_aos.environ.get("AETHER_MPS_WARMUP_SEQ", str(min(size, 1024)))))
+    attn_dim = max(8, int(_aos.environ.get("AETHER_MPS_WARMUP_HEAD_DIM", "128")))
+
+    def _round_up(v, multiple):
+        return ((int(v) + multiple - 1) // multiple) * multiple
+
+    align_enable = _aos.environ.get("AETHER_MPS_WARMUP_ALIGN", "1") != "0"
+    if align_enable:
+        size = max(size, _round_up(size, 8))
+        attn_dim = max(attn_dim, _round_up(attn_dim, 16))
+        attn_seq = max(attn_seq, _round_up(attn_seq, 16))
+
+    try:
+        attn_steps_default = max(1, min(steps, 4))
+    except Exception:
+        attn_steps_default = 1
+    attn_steps = attn_steps_default
+    if attn_steps_env:
+        try:
+            attn_steps = max(1, int(attn_steps_env))
+        except Exception:
+            print(
+                f"[MPS] Invalid AETHER_MPS_WARMUP_ATTENTION_STEPS={attn_steps_env!r}; using {attn_steps_default}"
+            )
+            attn_steps = attn_steps_default
+
+    super_enable = _aos.environ.get("AETHER_MPS_WARMUP_SUPERCHARGE", "1") != "0"
+    super_steps_env = _aos.environ.get("AETHER_MPS_WARMUP_SUPER_STEPS")
+    super_batch_env = _aos.environ.get("AETHER_MPS_WARMUP_BATCH", "4")
+    ff_dim_env = _aos.environ.get("AETHER_MPS_WARMUP_FF_DIM")
+    ff_mult_env = _aos.environ.get("AETHER_MPS_WARMUP_FF_MULT", "4")
+    ff_cap_env = _aos.environ.get("AETHER_MPS_WARMUP_FF_CAP")
+
+    try:
+        super_batch = max(1, int(super_batch_env))
+    except Exception:
+        print(
+            f"[MPS] Invalid AETHER_MPS_WARMUP_BATCH={super_batch_env!r}; using 4"
+        )
+        super_batch = 4
+
+    ff_mult_default = 4
+    try:
+        ff_mult = max(1, int(ff_mult_env))
+    except Exception:
+        print(
+            f"[MPS] Invalid AETHER_MPS_WARMUP_FF_MULT={ff_mult_env!r}; using {ff_mult_default}"
+        )
+        ff_mult = ff_mult_default
+
+    if ff_cap_env is not None:
+        try:
+            ff_cap = max(8, int(ff_cap_env))
+        except Exception:
+            print(
+                f"[MPS] Invalid AETHER_MPS_WARMUP_FF_CAP={ff_cap_env!r}; using max({size}*8, 8192)"
+            )
+            ff_cap = max(size * 8, 8192)
+    else:
+        ff_cap = max(size * 8, 8192)
+
+    if ff_dim_env is not None:
+        try:
+            ff_dim = max(8, int(ff_dim_env))
+        except Exception:
+            print(
+                f"[MPS] Invalid AETHER_MPS_WARMUP_FF_DIM={ff_dim_env!r}; using derived"
+            )
+            ff_dim = max(8, min(size * ff_mult, ff_cap))
+    else:
+        ff_dim = max(8, min(size * ff_mult, ff_cap))
+    if align_enable:
+        ff_dim = max(ff_dim, _round_up(ff_dim, 32))
+
+    super_steps_default = max(1, min(steps, 6))
+    super_steps = super_steps_default
+    if super_steps_env is not None:
+        try:
+            super_steps = max(1, int(super_steps_env))
+        except Exception:
+            print(
+                f"[MPS] Invalid AETHER_MPS_WARMUP_SUPER_STEPS={super_steps_env!r}; using {super_steps_default}"
+            )
+            super_steps = super_steps_default
+
+    lora_enable = _aos.environ.get("AETHER_MPS_WARMUP_LORA", "1") != "0"
+    lora_rank_env = _aos.environ.get("AETHER_MPS_WARMUP_LORA_RANK", "160")
+    lora_alpha_env = _aos.environ.get("AETHER_MPS_WARMUP_LORA_ALPHA", "320")
+    lora_batch_env = _aos.environ.get("AETHER_MPS_WARMUP_LORA_BATCH")
+    lora_steps_env = _aos.environ.get("AETHER_MPS_WARMUP_LORA_STEPS")
+
+    try:
+        lora_rank = max(1, int(lora_rank_env))
+    except Exception:
+        print(
+            f"[MPS] Invalid AETHER_MPS_WARMUP_LORA_RANK={lora_rank_env!r}; using 160"
+        )
+        lora_rank = 160
+
+    try:
+        lora_alpha = max(1.0, float(lora_alpha_env))
+    except Exception:
+        print(
+            f"[MPS] Invalid AETHER_MPS_WARMUP_LORA_ALPHA={lora_alpha_env!r}; using 320"
+        )
+        lora_alpha = 320.0
+
+    if lora_batch_env is None:
+        lora_batch = super_batch
+    else:
+        try:
+            lora_batch = max(1, int(lora_batch_env))
+        except Exception:
+            print(
+                f"[MPS] Invalid AETHER_MPS_WARMUP_LORA_BATCH={lora_batch_env!r}; using {super_batch}"
+            )
+            lora_batch = super_batch
+
+    lora_steps_default = max(1, min(steps, 8))
+    if lora_steps_env is None:
+        lora_steps = lora_steps_default
+    else:
+        try:
+            lora_steps = max(1, int(lora_steps_env))
+        except Exception:
+            print(
+                f"[MPS] Invalid AETHER_MPS_WARMUP_LORA_STEPS={lora_steps_env!r}; using {lora_steps_default}"
+            )
+            lora_steps = lora_steps_default
+
+    bandwidth_enable = _aos.environ.get("AETHER_MPS_WARMUP_BANDWIDTH", "1") != "0"
+    bandwidth_mb_env = _aos.environ.get("AETHER_MPS_WARMUP_BW_MB", "256")
+    bandwidth_steps_env = _aos.environ.get("AETHER_MPS_WARMUP_BW_STEPS")
+
+    try:
+        bandwidth_mb = max(1, int(bandwidth_mb_env))
+    except Exception:
+        print(
+            f"[MPS] Invalid AETHER_MPS_WARMUP_BW_MB={bandwidth_mb_env!r}; using 256"
+        )
+        bandwidth_mb = 256
+
+    bandwidth_steps_default = max(1, steps)
+    if bandwidth_steps_env is None:
+        bandwidth_steps = bandwidth_steps_default
+    else:
+        try:
+            bandwidth_steps = max(1, int(bandwidth_steps_env))
+        except Exception:
+            print(
+                f"[MPS] Invalid AETHER_MPS_WARMUP_BW_STEPS={bandwidth_steps_env!r}; using {bandwidth_steps_default}"
+            )
+            bandwidth_steps = bandwidth_steps_default
+
+    try:
+        device = torch.device("mps")
+        with torch.no_grad():
+            x = torch.randn((size, size), device=device, dtype=dtype)
+            y = torch.randn((size, size), device=device, dtype=dtype)
+            matmul_start = _atime.perf_counter()
+            for _ in range(steps):
+                z = torch.matmul(x, y)
+                x, y = y, z
+            if sync and hasattr(torch.mps, "synchronize"):
+                torch.mps.synchronize()
+            matmul_elapsed = _atime.perf_counter() - matmul_start
+
+            attn_elapsed = 0.0
+            attn_tok_per_sec = 0.0
+            if attn_enable:
+                if F is None or not hasattr(F, "scaled_dot_product_attention"):
+                    print("[MPS] attention warmup skipped: SDPA unavailable")
+                else:
+                    try:
+                        q = torch.randn(
+                            (1, attn_heads, attn_seq, attn_dim),
+                            device=device,
+                            dtype=dtype,
+                        )
+                        k = torch.randn_like(q)
+                        v = torch.randn_like(q)
+                        attn_start = _atime.perf_counter()
+                        for _ in range(attn_steps):
+                            F.scaled_dot_product_attention(
+                                q, k, v, is_causal=True, dropout_p=0.0
+                            )
+                        if sync and hasattr(torch.mps, "synchronize"):
+                            torch.mps.synchronize()
+                        attn_elapsed = _atime.perf_counter() - attn_start
+                        approx_tokens = float(attn_steps * attn_seq * attn_heads)
+                        attn_tok_per_sec = approx_tokens / max(attn_elapsed, 1e-6)
+                    except Exception as e:
+                        print(f"[MPS] attention warmup skipped: {e}")
+
+            ff_elapsed = 0.0
+            ff_gflops_per_s = 0.0
+            if super_enable:
+                gelu_fn = None
+                if F is not None and hasattr(F, "gelu"):
+                    gelu_fn = F.gelu
+                else:
+                    gelu_cls = getattr(getattr(torch, "nn", None), "GELU", None)
+                    if gelu_cls is not None:
+                        gelu_inst = gelu_cls()
+
+                        def gelu_fn(x):
+                            return gelu_inst(x)
+
+                if gelu_fn is None:
+
+                    def gelu_fn(x):
+                        return 0.5 * x * (
+                            1.0
+                            + torch.tanh(
+                                0.7978845608 * (x + 0.044715 * x * x * x)
+                            )
+                        )
+
+                try:
+                    ff_input = torch.randn(
+                        (super_batch, size), device=device, dtype=dtype
+                    )
+                    w1 = torch.randn((size, ff_dim), device=device, dtype=dtype)
+                    w2 = torch.randn((ff_dim, size), device=device, dtype=dtype)
+                    b1 = torch.randn((ff_dim,), device=device, dtype=dtype)
+                    b2 = torch.randn((size,), device=device, dtype=dtype)
+                    ff_start = _atime.perf_counter()
+                    for _ in range(super_steps):
+                        h = torch.matmul(ff_input, w1) + b1
+                        h = gelu_fn(h)
+                        ff_input = torch.matmul(h, w2) + b2
+                    if sync and hasattr(torch.mps, "synchronize"):
+                        torch.mps.synchronize()
+                    ff_elapsed = _atime.perf_counter() - ff_start
+                    total_flops = float(super_steps) * 4.0 * super_batch * size * ff_dim
+                    ff_gflops_per_s = total_flops / max(ff_elapsed, 1e-6) / 1e9
+                except Exception as e:
+                    print(f"[MPS] FFN supercharge skipped: {e}")
+
+            lora_elapsed = 0.0
+            lora_gflops_per_s = 0.0
+            if lora_enable:
+                try:
+                    lora_input = torch.randn(
+                        (lora_batch, size), device=device, dtype=dtype
+                    )
+                    lora_a = torch.randn((size, lora_rank), device=device, dtype=dtype)
+                    lora_b = torch.randn((lora_rank, size), device=device, dtype=dtype)
+                    lora_scale = lora_alpha / float(lora_rank)
+                    lora_start = _atime.perf_counter()
+                    for _ in range(lora_steps):
+                        update = torch.matmul(lora_input, lora_a)
+                        update = torch.matmul(update, lora_b) * lora_scale
+                        lora_input = lora_input + update
+                    if sync and hasattr(torch.mps, "synchronize"):
+                        torch.mps.synchronize()
+                    lora_elapsed = _atime.perf_counter() - lora_start
+                    total_flops = (
+                        float(lora_steps) * 4.0 * lora_batch * size * lora_rank
+                    )
+                    lora_gflops_per_s = total_flops / max(lora_elapsed, 1e-6) / 1e9
+                except Exception as e:
+                    print(f"[MPS] LoRA boost skipped: {e}")
+
+            bandwidth_elapsed = 0.0
+            bandwidth_gbps = 0.0
+            if bandwidth_enable:
+                try:
+                    elem_bytes = torch.tensor([], dtype=dtype).element_size()
+                    target_bytes = bandwidth_mb * 1024 * 1024
+                    scratch_cols = max(
+                        size, int(target_bytes / max(elem_bytes, 1))
+                    )
+                    scratch = torch.randn(
+                        (super_batch, scratch_cols), device=device, dtype=dtype
+                    )
+                    scratch_alt = torch.randn_like(scratch)
+                    bandwidth_start = _atime.perf_counter()
+                    for _ in range(bandwidth_steps):
+                        torch.add(scratch, scratch_alt, alpha=1.0, out=scratch_alt)
+                        torch.mul(scratch_alt, 1.0009765625, out=scratch)
+                    if sync and hasattr(torch.mps, "synchronize"):
+                        torch.mps.synchronize()
+                    bandwidth_elapsed = _atime.perf_counter() - bandwidth_start
+                    bytes_touched = (
+                        float(bandwidth_steps)
+                        * scratch.numel()
+                        * elem_bytes
+                        * 3.0
+                    )
+                    bandwidth_gbps = bytes_touched / max(bandwidth_elapsed, 1e-6) / (1024 ** 3)
+                except Exception as e:
+                    print(f"[MPS] bandwidth sweep skipped: {e}")
+
+        total_elapsed = (
+            matmul_elapsed
+            + attn_elapsed
+            + ff_elapsed
+            + lora_elapsed
+            + bandwidth_elapsed
+        )
+        msg = (
+            f"[MPS] warmup pumped {steps}x matmul (size={size}, dtype={dtype_name}) "
+            f"in {matmul_elapsed:.3f}s"
+        )
+        if attn_enable and attn_elapsed > 0.0:
+            msg += (
+                f"; attention warmup {attn_steps}x (seq={attn_seq}, heads={attn_heads}, "
+                f"dim={attn_dim}) in {attn_elapsed:.3f}s (~{attn_tok_per_sec:,.0f} tok/s)"
+            )
+        if super_enable and ff_elapsed > 0.0:
+            msg += (
+                f"; ff-supercharge {super_steps}x (batch={super_batch}, hidden={ff_dim}) "
+                f"in {ff_elapsed:.3f}s (~{ff_gflops_per_s:,.1f} GFLOP/s)"
+            )
+        if lora_enable and lora_elapsed > 0.0:
+            msg += (
+                f"; lora-boost {lora_steps}x (batch={lora_batch}, rank={lora_rank}, alpha={lora_alpha:g}) "
+                f"in {lora_elapsed:.3f}s (~{lora_gflops_per_s:,.1f} GFLOP/s)"
+            )
+        if bandwidth_enable and bandwidth_elapsed > 0.0:
+            msg += (
+                f"; bandwidth-sweep {bandwidth_steps}x (~{bandwidth_mb} MiB window) "
+                f"in {bandwidth_elapsed:.3f}s (~{bandwidth_gbps:,.1f} GiB/s)"
+            )
+        msg += f" [total {total_elapsed:.3f}s]"
+        print(msg)
+    except Exception as e:
+        print(f"[MPS] warmup failed: {e}")
+
+
+if _aos.environ.get("AETHER_DISABLE_MPS_WARMUP", "0") != "1":
+    _aether_mps_warmup()
 
 
 # ---------------------------------------
@@ -799,12 +1236,18 @@ except Exception:
     SpiralPumpEngine = None
 
     def pump_detect_backend():
-        import torch
+        try:
+            import torch
+        except Exception:
+            return "cpu"
 
+        try:
+            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                return "mps"
+        except Exception:
+            pass
         if torch.cuda.is_available():
             return "cuda"
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return "mps"
         return "cpu"
 
 
@@ -878,14 +1321,21 @@ def zero_nan_(t: torch.Tensor):
 
 # ====== Tiled SDPA (replace F.sdpa) =========================================
 _ORIG_SDPA = F.scaled_dot_product_attention
+_DEFAULT_TILE_Q = int(os.environ.get("AETHER_MPS_FLASH_TILE_Q", "192"))
+_DEFAULT_TILE_K = int(os.environ.get("AETHER_MPS_FLASH_TILE_K", "320"))
+_DEFAULT_FLASH_FP32 = os.environ.get("AETHER_MPS_FLASH_FP32", "1") != "0"
+_DEFAULT_WINDOW = int(os.environ.get("AETHER_MPS_FLASH_WINDOW", "0"))
+_DEFAULT_GLOBAL_TOKENS = int(os.environ.get("AETHER_MPS_FLASH_GLOBALS", "0"))
+_DEFAULT_GLOBAL_STRIDE = int(os.environ.get("AETHER_MPS_FLASH_STRIDE", "0"))
+
 _PATCHED_SDPA = {
     "on": False,
-    "tile_q": 128,
-    "tile_k": 256,
-    "fp32": True,
-    "window": 0,  # 0=OFF, >0: local band (past window only)
-    "global_tokens": 0,  # always-allowed keys from head
-    "global_stride": 0,  # evenly spaced globals (0=off)
+    "tile_q": max(16, _DEFAULT_TILE_Q),
+    "tile_k": max(32, _DEFAULT_TILE_K),
+    "fp32": bool(_DEFAULT_FLASH_FP32),
+    "window": max(0, _DEFAULT_WINDOW),  # 0=OFF, >0: local band (past window only)
+    "global_tokens": max(0, _DEFAULT_GLOBAL_TOKENS),  # always-allowed keys from head
+    "global_stride": max(0, _DEFAULT_GLOBAL_STRIDE),  # evenly spaced globals (0=off)
 }
 
 
@@ -915,8 +1365,8 @@ def streaming_sdpa_mps(
     attn_mask=None,
     dropout_p=0.0,
     is_causal=False,
-    tile_q=128,
-    tile_k=256,
+    tile_q=192,
+    tile_k=320,
     compute_in_fp32=True,
     window_size: int = 0,
     global_tokens: int = 0,
@@ -1031,7 +1481,7 @@ def _patched_sdpa(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, scale
     )
 
 
-def enable_tiled_sdpa(tile_q=128, tile_k=256, compute_in_fp32=True):
+def enable_tiled_sdpa(tile_q=192, tile_k=320, compute_in_fp32=True):
     if not _PATCHED_SDPA["on"]:
         setattr(F, "scaled_dot_product_attention", _patched_sdpa)
         _PATCHED_SDPA["on"] = True
@@ -1050,6 +1500,45 @@ def disable_tiled_sdpa():
     if _PATCHED_SDPA["on"]:
         setattr(F, "scaled_dot_product_attention", _ORIG_SDPA)
         _PATCHED_SDPA["on"] = False
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return int(default)
+    try:
+        return int(raw)
+    except Exception:
+        print(f"[ENV] invalid int for {name}={raw!r}; using {default}")
+        return int(default)
+
+
+def _auto_enable_mps_flash_attention():
+    if os.environ.get("AETHER_DISABLE_MPS_FLASH", "0") == "1":
+        return
+    try:
+        import torch
+
+        if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+            return
+    except Exception:
+        return
+
+    tile_q = max(16, _env_int("AETHER_MPS_FLASH_TILE_Q", _PATCHED_SDPA["tile_q"]))
+    tile_k = max(32, _env_int("AETHER_MPS_FLASH_TILE_K", _PATCHED_SDPA["tile_k"]))
+    fp32 = os.environ.get("AETHER_MPS_FLASH_FP32", "1") != "0"
+    enable_tiled_sdpa(tile_q=tile_q, tile_k=tile_k, compute_in_fp32=fp32)
+    window = _env_int("AETHER_MPS_FLASH_WINDOW", _PATCHED_SDPA["window"])
+    globals_n = _env_int("AETHER_MPS_FLASH_GLOBALS", _PATCHED_SDPA["global_tokens"])
+    stride = _env_int("AETHER_MPS_FLASH_STRIDE", _PATCHED_SDPA["global_stride"])
+    if window > 0 or globals_n > 0 or stride > 0:
+        set_sliding_window(window, globals_n, stride)
+    print(
+        f"[MPS][FLASH] enabled streaming attention (tile_q={tile_q}, tile_k={tile_k}, window={window}, globals={globals_n}, stride={stride})"
+    )
+
+
+_auto_enable_mps_flash_attention()
 
 
 # ====== INT8 base + LoRA (custom; PEFT排他側で利用) ==========================
@@ -1099,7 +1588,7 @@ class LinearInt8Base(nn.Module):
 
 
 class LinearInt8LoRA(nn.Module):
-    def __init__(self, in_f, out_f, r=8, alpha=32, dropout=0.0, bias=False):
+    def __init__(self, in_f, out_f, r=160, alpha=320, dropout=0.0, bias=False):
         super().__init__()
         self.base = LinearInt8Base(in_f, out_f, bias=bias)
         self.lora_A = nn.Linear(in_f, r, bias=False)
@@ -1115,8 +1604,8 @@ class LinearInt8LoRA(nn.Module):
 
 def convert_linear_to_int8_lora(
     model: nn.Module,
-    r: int = 8,
-    alpha: int = 32,
+    r: int = 160,
+    alpha: int = 320,
     dropout: float = 0.0,
     include_names: Optional[List[str]] = None,
     exclude_names: Tuple[str, ...] = ("emb", "head"),
@@ -1587,8 +2076,8 @@ class TrainConfig:
     byte_noise: float = 0.0
     span_mask_prob: float = 0.02
     span_mask_len: int = 8
-    tiled_q: int = 128
-    tiled_k: int = 256
+    tiled_q: int = 192
+    tiled_k: int = 320
     mps_sync_every: int = 0
     # LVI regs / switches
     lvi_mv_weight: float = 0.10
@@ -1659,6 +2148,28 @@ class FabricLite:
                     pass
         ks = ", ".join([f"{k}={v:.4f}" for k, v in d.items()])
         print(f"[LOG] step={step} | {ks}")
+
+
+class ThroughputMeter:
+    def __init__(self, beta: float = 0.90):
+        self.beta = float(beta)
+        self.value = 0.0
+        self.ready = False
+
+    def update(self, tokens: float, seconds: float) -> float:
+        if seconds <= 0:
+            return self.value if self.ready else 0.0
+        inst = float(tokens) / max(seconds, 1e-6)
+        if not self.ready:
+            self.value = inst
+            self.ready = True
+        else:
+            self.value = self.beta * self.value + (1.0 - self.beta) * inst
+        return self.value
+
+    def reset(self):
+        self.value = 0.0
+        self.ready = False
 
 
 class ChronoScheduler:
@@ -1732,8 +2243,8 @@ except Exception:
 
 def apply_peft_lora(
     model: nn.Module,
-    r: int = 8,
-    alpha: int = 32,
+    r: int = 160,
+    alpha: int = 320,
     dropout: float = 0.05,
     targets: Optional[List[str]] = None,
 ) -> nn.Module:
@@ -1775,8 +2286,8 @@ def apply_hybrid_lora(
     model: nn.Module,
     peft_targets: List[str],
     int8_include: Optional[List[str]],
-    r: int = 8,
-    alpha: int = 32,
+    r: int = 160,
+    alpha: int = 320,
     dropout: float = 0.05,
 ) -> nn.Module:
     if not PEFT_AVAILABLE:
@@ -2027,6 +2538,18 @@ class AetherTrainerBase:
         self.fabric = FabricLite(cfg.out_dir, use_tb=cfg.use_tb)
         self.psy = PsyAugment(tok)
         self._global_step = 0
+        beta_env = os.environ.get("AETHER_TPS_EMA_BETA", "")
+        tps_beta = 0.90
+        if beta_env:
+            try:
+                tps_beta = float(beta_env)
+            except Exception:
+                print(
+                    f"[THROUGHPUT] Invalid AETHER_TPS_EMA_BETA={beta_env!r}; using {tps_beta}"
+                )
+        self._tps_meter = ThroughputMeter(beta=tps_beta)
+        self._last_tok_per_sec = 0.0
+        self._last_tok_per_sec_ema = 0.0
 
         wd = 0.01
 
@@ -2257,8 +2780,8 @@ class AetherTrainerBase:
             ]
             self.model = apply_peft_lora(
                 self.model,
-                r=int(getattr(self.cfg, "lora_r", 8)),
-                alpha=int(getattr(self.cfg, "lora_alpha", 32)),
+                r=int(getattr(self.cfg, "lora_r", 160)),
+                alpha=int(getattr(self.cfg, "lora_alpha", 320)),
                 dropout=float(getattr(self.cfg, "lora_dropout", 0.05)),
                 targets=targets,
             ).to(self.device)
@@ -2404,6 +2927,9 @@ class AetherTrainerMPS(AetherTrainerBase):
             steps_per_epoch = self.cfg.max_steps or 10**9
         total_steps = self.cfg.max_steps or int(self.cfg.epochs * steps_per_epoch)
         sched = ChronoScheduler(self.opt, self.cfg, total_steps=total_steps)
+        self._tps_meter.reset()
+        self._last_tok_per_sec = 0.0
+        self._last_tok_per_sec_ema = 0.0
 
         pad_id = self.tok.PAD
         self.model.train()
@@ -2734,6 +3260,9 @@ class AetherTrainerMPS(AetherTrainerBase):
                 elapsed = time.time() - t0
                 t0 = time.time()
                 tps = float(total_tok) / max(1e-6, elapsed)
+                ema_tps = self._tps_meter.update(total_tok, elapsed)
+                self._last_tok_per_sec = float(tps)
+                self._last_tok_per_sec_ema = float(ema_tps)
                 lr_mult = sched.step()
                 step += 1
                 self._global_step = step
@@ -2945,6 +3474,7 @@ class AetherTrainerMPS(AetherTrainerBase):
                             "train/ce": float(loss_avg),
                             "train/ppl": float(ppl),
                             "train/tok_s": float(tps),
+                            "train/tok_s_ema": float(ema_tps),
                             "train/lr_mult": float(lr_mult),
                         },
                         step=step,
@@ -3205,6 +3735,14 @@ class AetherTrainerMPS(AetherTrainerBase):
             if not torch.isfinite(p.grad).all():
                 p.grad.zero_()
 
+    @property
+    def tok_per_sec(self) -> float:
+        return float(self._last_tok_per_sec)
+
+    @property
+    def tok_per_sec_ema(self) -> float:
+        return float(self._last_tok_per_sec_ema)
+
 
 # ====== Lightning Fabric (optional placeholder) =============================
 _HAVE_FABRIC = False
@@ -3299,8 +3837,8 @@ def __aether_main__():
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--warmup", type=int, default=300)
     ap.add_argument("--out_dir", type=str, default="runs/v28")
-    ap.add_argument("--tiled_q", type=int, default=128)
-    ap.add_argument("--tiled_k", type=int, default=256)
+    ap.add_argument("--tiled_q", type=int, default=192)
+    ap.add_argument("--tiled_k", type=int, default=320)
     # attention window
     ap.add_argument("--window_size", type=int, default=0)
     ap.add_argument("--global_tokens", type=int, default=0)
@@ -3334,8 +3872,8 @@ def __aether_main__():
     ap.add_argument(
         "--hybrid_lora", action="store_true", help="PEFT + INT8-LoRA hybrid"
     )
-    ap.add_argument("--lora_r", type=int, default=8)
-    ap.add_argument("--lora_alpha", type=int, default=32)
+    ap.add_argument("--lora_r", type=int, default=160)
+    ap.add_argument("--lora_alpha", type=int, default=320)
     ap.add_argument("--lora_dropout", type=float, default=0.05)
     ap.add_argument("--save_adapter", type=str, default="")
     # tracing
