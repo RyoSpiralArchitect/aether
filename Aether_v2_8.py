@@ -415,6 +415,9 @@ _AETHER_DEFAULT_LORA_R = int(
 class FlashAttentionRuntime:
     def __init__(self):
         self._eps = 1e-6
+        self._fallbacks = 0
+        self._compiled_impl = None
+        self._compile_failed = False
 
     def _block_sizes(self):
         bq = max(1, int(_aos.environ.get("AETHER_FLASH_BLOCK_Q", "128")))
@@ -463,46 +466,69 @@ class FlashAttentionRuntime:
         key_block = (~key_valid).view(key_valid.shape[0], 1, 1, key_valid.shape[1])
         return key_block.expand(-1, 1, i1 - i0, -1).to(device)
 
-    def __call__(
+    def _call_impl(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        *,
         pad_mask: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
         dropout_p: float = 0.0,
         is_causal: bool = True,
         training: bool = False,
+        scale_override: Optional[float] = None,
     ) -> torch.Tensor:
-        B, H, T, D = q.shape
+        B, H, Tq, D = q.shape
+        Tk = k.shape[2]
         block_q, block_k = self._block_sizes()
-        out = torch.zeros_like(q)
-        scale = 1.0 / math.sqrt(max(1, D))
+        out = torch.empty((B, H, Tq, D), dtype=q.dtype, device=q.device)
+        scale = (
+            float(scale_override)
+            if scale_override is not None
+            else 1.0 / math.sqrt(max(1, D))
+        )
         eps = float(_aos.environ.get("AETHER_FLASH_EPS", self._eps))
-        for i0 in range(0, T, block_q):
-            i1 = min(i0 + block_q, T)
+        k_t = k.transpose(-1, -2).contiguous()
+        q_positions = (
+            torch.arange(Tq, device=q.device, dtype=torch.int32)
+            if is_causal
+            else None
+        )
+        k_positions = (
+            torch.arange(Tk, device=q.device, dtype=torch.int32)
+            if is_causal
+            else None
+        )
+        pad_mask_bool = None
+        if pad_mask is not None:
+            pad_mask_bool = pad_mask.to(torch.bool)
+        attn_mask_local = attn_mask
+        for i0 in range(0, Tq, block_q):
+            i1 = min(i0 + block_q, Tq)
             q_blk = q[:, :, i0:i1, :]
+            blk_len = q_blk.shape[2]
             q_pos = None
-            if is_causal:
-                q_pos = torch.arange(i0, i1, device=q.device)
+            if is_causal and q_positions is not None:
+                q_pos = q_positions[i0:i1].to(q.device)
             m_i = torch.full(
-                (B, H, i1 - i0), float("-inf"), dtype=torch.float32, device=q.device
+                (B, H, blk_len),
+                -1e9,
+                dtype=torch.float32,
+                device=q.device,
             )
-            l_i = torch.zeros((B, H, i1 - i0), dtype=torch.float32, device=q.device)
-            o_i = torch.zeros((B, H, i1 - i0, D), dtype=q.dtype, device=q.device)
-            for j0 in range(0, T, block_k):
-                j1 = min(j0 + block_k, T)
-                scores = torch.einsum(
-                    "bhqd,bhkd->bhqk", q_blk, k[:, :, j0:j1, :]
-                ).to(torch.float32)
+            l_i = torch.zeros((B, H, blk_len), dtype=torch.float32, device=q.device)
+            o_i = torch.zeros((B, H, blk_len, D), dtype=q.dtype, device=q.device)
+            for j0 in range(0, Tk, block_k):
+                j1 = min(j0 + block_k, Tk)
+                k_blk = k_t[:, :, :, j0:j1]
+                scores = torch.matmul(q_blk, k_blk).to(torch.float32)
                 scores.mul_(scale)
                 mask_block = None
-                if attn_mask is not None:
-                    mask_block = self._slice_mask(attn_mask, i0, i1, j0, j1)
+                if attn_mask_local is not None:
+                    mask_block = self._slice_mask(attn_mask_local, i0, i1, j0, j1)
                 if mask_block is None:
                     mask_block = self._pad_mask_slice(
-                        pad_mask, i0, i1, j0, j1, scores.device
+                        pad_mask_bool, i0, i1, j0, j1, scores.device
                     )
                 if mask_block is not None:
                     if mask_block.dtype == torch.bool:
@@ -511,8 +537,8 @@ class FlashAttentionRuntime:
                         scores = scores + mask_block.to(scores.dtype)
                 if is_causal:
                     if q_pos is None:
-                        q_pos = torch.arange(i0, i1, device=q.device)
-                    k_pos = torch.arange(j0, j1, device=q.device)
+                        q_pos = q_positions[i0:i1].to(q.device)
+                    k_pos = k_positions[j0:j1].to(q.device)
                     causal = k_pos.view(1, 1, 1, -1) > q_pos.view(1, 1, -1, 1)
                     scores = scores.masked_fill(causal, float("-inf"))
                 block_max = torch.max(scores, dim=-1).values
@@ -543,13 +569,56 @@ class FlashAttentionRuntime:
                 m_i = m_new
             denom = l_i.clamp_min(eps).unsqueeze(-1).to(q.dtype)
             o_blk = o_i / denom
-            if pad_mask is not None:
-                valid = pad_mask[:, i0:i1]
+            if pad_mask_bool is not None:
+                valid = pad_mask_bool[:, i0:i1]
                 if valid.dtype != torch.bool:
                     valid = valid.to(torch.bool)
                 o_blk = o_blk * valid.view(B, 1, i1 - i0, 1)
             out[:, :, i0:i1, :] = o_blk
         return out
+
+    def __call__(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        pad_mask: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
+        dropout_p: float = 0.0,
+        is_causal: bool = True,
+        training: bool = False,
+        scale_override: Optional[float] = None,
+    ) -> torch.Tensor:
+        impl = self._call_impl
+        if (
+            self.should_use(q)
+            and self._compiled_impl is None
+            and not self._compile_failed
+            and hasattr(torch, "compile")
+        ):
+            try:
+                self._compiled_impl = torch.compile(
+                    self._call_impl,
+                    dynamic=True,
+                    backend=_aos.environ.get("AETHER_FLASH_COMPILE_BACKEND", "inductor"),
+                )
+                print("[MPS][FLASH] compiled attention kernel active")
+            except Exception:
+                self._compile_failed = True
+        if self._compiled_impl is not None and self.should_use(q):
+            impl = self._compiled_impl
+        return impl(
+            q,
+            k,
+            v,
+            pad_mask=pad_mask,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+            training=training,
+            scale_override=scale_override,
+        )
 
 
 _FLASH_ATTENTION = FlashAttentionRuntime()
@@ -1349,6 +1418,33 @@ def streaming_sdpa_mps(
 
 
 def _patched_sdpa(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
+    window = int(_PATCHED_SDPA["window"])
+    globals_n = int(_PATCHED_SDPA["global_tokens"])
+    stride = int(_PATCHED_SDPA["global_stride"])
+    prefer_flash = (
+        window <= 0
+        and globals_n <= 0
+        and stride <= 0
+        and _FLASH_ATTENTION.should_use(q)
+    )
+
+    if prefer_flash:
+        try:
+            return _FLASH_ATTENTION(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                dropout_p=float(dropout_p or 0.0),
+                is_causal=bool(is_causal),
+                training=bool(dropout_p and dropout_p > 0.0),
+                scale_override=scale,
+            )
+        except Exception as err:
+            if _FLASH_ATTENTION._fallbacks < 3:
+                print(f"[MPS][FLASH] fallback to streaming SDPA: {err}")
+            _FLASH_ATTENTION._fallbacks += 1
+
     return streaming_sdpa_mps(
         q,
         k,
@@ -1359,9 +1455,9 @@ def _patched_sdpa(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, scale
         _PATCHED_SDPA["tile_q"],
         _PATCHED_SDPA["tile_k"],
         _PATCHED_SDPA["fp32"],
-        _PATCHED_SDPA["window"],
-        _PATCHED_SDPA["global_tokens"],
-        _PATCHED_SDPA["global_stride"],
+        window,
+        globals_n,
+        stride,
     )
 
 
@@ -1418,7 +1514,8 @@ def _auto_enable_mps_flash_attention():
     if window > 0 or globals_n > 0 or stride > 0:
         set_sliding_window(window, globals_n, stride)
     print(
-        f"[MPS][FLASH] enabled streaming attention (tile_q={tile_q}, tile_k={tile_k}, window={window}, globals={globals_n}, stride={stride})"
+        "[MPS][FLASH] defaulted to custom kernel "
+        f"(tile_q={tile_q}, tile_k={tile_k}, window={window}, globals={globals_n}, stride={stride})"
     )
 
 
@@ -1476,20 +1573,28 @@ class LinearInt8LoRA(nn.Module):
         self,
         in_f,
         out_f,
-        r: int = _AETHER_DEFAULT_LORA_R,
-        alpha: int = 32,
+        r: Optional[int] = None,
+        alpha: Optional[int] = None,
         dropout: float = 0.0,
         bias: bool = False,
     ):
-
-    def __init__(self, in_f, out_f, r=160, alpha=320, dropout=0.0, bias=False):
-        origin/main:Aether_v2_8.py
         super().__init__()
+        rank = _AETHER_DEFAULT_LORA_R if r is None else int(r)
+        if rank <= 0:
+            raise ValueError("LoRA rank must be > 0")
+        alpha_val = alpha if alpha is not None else max(1, rank * 2)
+        self.rank = rank
+        self.alpha = int(alpha_val)
         self.base = LinearInt8Base(in_f, out_f, bias=bias)
-        self.lora_A = nn.Linear(in_f, r, bias=False)
-        self.lora_B = nn.Linear(r, out_f, bias=False)
-        self.scal = float(alpha / max(1, r))
+        self.lora_A = nn.Linear(in_f, rank, bias=False)
+        self.lora_B = nn.Linear(rank, out_f, bias=False)
+        self.scal = float(self.alpha / max(1, rank))
         self.drop = nn.Dropout(dropout)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
 
     def forward(self, x):
         y = self.base(x)
@@ -1508,11 +1613,18 @@ def convert_linear_to_int8_lora(
 ) -> int:
     n = 0
     for name, m in list(model.named_modules()):
+        if isinstance(m, (LinearInt8LoRA, LinearInt8Base)):
+            continue
         if isinstance(m, nn.Linear):
             if getattr(m, "in_features", 1) == 0 or getattr(m, "out_features", 1) == 0:
                 print(
                     f"[INT8-LoRA] skip zero-sized Linear: {name} in={getattr(m, 'in_features', None)} out={getattr(m, 'out_features', None)}"
                 )
+                continue
+            if (
+                skip_if_out_equals is not None
+                and getattr(m, "out_features", None) == skip_if_out_equals
+            ):
                 continue
             if include_names is not None and not any(
                 (inc in name) for inc in include_names
@@ -1524,8 +1636,17 @@ def convert_linear_to_int8_lora(
             w = p[0].detach().to(torch.float32)
             b = p[1].detach() if (len(p) > 1 and p[1] is not None) else None
             q = LinearInt8LoRA(
-                m.in_features, m.out_features, r, alpha, dropout, bias=(b is not None)
+                m.in_features,
+                m.out_features,
+                r=r,
+                alpha=alpha,
+                dropout=dropout,
+                bias=(b is not None),
             )
+            try:
+                q = q.to(w.device)
+            except Exception:
+                pass
             q.base.load_from_float(w, b)
             # replace in parent
             parent = model
@@ -1986,6 +2107,11 @@ class TrainConfig:
     tiled_q: int = 192
     tiled_k: int = 320
     mps_sync_every: int = 0
+    loss_guard: float = 16.0
+    ppl_cap: float = 12.0
+    ppl_smooth_beta: float = 0.90
+    tps_target: float = 0.0
+    tps_boost_patience: int = 24
     # LVI regs / switches
     lvi_mv_weight: float = 0.10
     lvi_two_view_weight: float = 0.05
@@ -2034,6 +2160,199 @@ class TrainConfig:
     loader_pin_memory: bool = False
     prefetch_to_device: bool = True
     disallow_mps_fallback: bool = True
+    auto_mps_7b: bool = False
+    auto_mps_param_threshold: int = 5_000_000_000
+    auto_mps_target_seq: int = 4096
+    mps_7b_lora_rank: Optional[int] = None
+    mps_7b_lora_alpha: Optional[int] = None
+    mps_7b_lora_dropout: float = 0.05
+    mps_7b_int8_exclude: Tuple[str, ...] = ("emb", "head")
+    mps_7b_skip_if_out_equals: Optional[int] = None
+
+
+def _auto_tune_for_mps_7b(
+    model: nn.Module, cfg: TrainConfig, device: torch.device
+) -> Dict[str, Any]:
+    report: Dict[str, Any] = {}
+    if not getattr(cfg, "auto_mps_7b", False):
+        return report
+    if getattr(cfg, "_auto_mps_7b_done", False):
+        return report
+    cfg._auto_mps_7b_done = True  # type: ignore[attr-defined]
+    total_params = int(sum(p.numel() for p in model.parameters()))
+    report["params"] = total_params
+    if device.type != "mps":
+        report["skipped"] = "non_mps_device"
+        print("[MPS][7B] auto-tune skipped: device is not MPS")
+        return report
+    threshold = int(getattr(cfg, "auto_mps_param_threshold", 5_000_000_000))
+    if total_params < threshold:
+        report["skipped"] = "below_threshold"
+        print(
+            f"[MPS][7B] auto-tune skipped: params={total_params:,} < threshold={threshold:,}"
+        )
+        return report
+
+    adjustments: List[str] = []
+
+    def _update(name: str, current, new_val):
+        if current != new_val:
+            adjustments.append(f"{name}:{current}->{new_val}")
+            report[name] = {"old": current, "new": new_val}
+        return new_val
+
+    cfg.batch_size = _update("batch_size", cfg.batch_size, max(1, min(cfg.batch_size, 2)))
+    cfg.micro_batch = _update(
+        "micro_batch", cfg.micro_batch, max(1, min(cfg.micro_batch, cfg.batch_size))
+    )
+    cfg.adaptive_micro_max = _update(
+        "adaptive_micro_max",
+        cfg.adaptive_micro_max,
+        max(cfg.adaptive_micro_max, cfg.micro_batch * 4),
+    )
+    cfg.loader_num_workers = _update(
+        "loader_num_workers", cfg.loader_num_workers, max(cfg.loader_num_workers, 2)
+    )
+    cfg.loader_prefetch_factor = _update(
+        "loader_prefetch_factor",
+        cfg.loader_prefetch_factor,
+        max(cfg.loader_prefetch_factor, 6),
+    )
+    if cfg.loader_num_workers > 0 and not cfg.loader_persistent_workers:
+        cfg.loader_persistent_workers = True
+        adjustments.append("loader_persistent_workers:False->True")
+        report["loader_persistent_workers"] = {"old": False, "new": True}
+    if not cfg.loader_pin_memory:
+        cfg.loader_pin_memory = True
+        adjustments.append("loader_pin_memory:False->True")
+        report["loader_pin_memory"] = {"old": False, "new": True}
+    if not cfg.prefetch_to_device:
+        cfg.prefetch_to_device = True
+        adjustments.append("prefetch_to_device:False->True")
+    if not cfg.disallow_mps_fallback:
+        cfg.disallow_mps_fallback = True
+        adjustments.append("disallow_mps_fallback:False->True")
+    if not cfg.grad_scaler:
+        cfg.grad_scaler = True
+        adjustments.append("grad_scaler:False->True")
+    if not cfg.prefer_bfloat16:
+        cfg.prefer_bfloat16 = True
+        adjustments.append("prefer_bfloat16:False->True")
+    matmul_mode = getattr(cfg, "matmul_precision", None)
+    if not matmul_mode:
+        cfg.matmul_precision = "high"
+        adjustments.append("matmul_precision:None->high")
+        report["matmul_precision"] = {"old": None, "new": "high"}
+    target_window = int(getattr(cfg, "auto_mps_target_seq", 4096))
+    if target_window > 0:
+        new_window = cfg.window_size if cfg.window_size > 0 else target_window
+        new_window = max(new_window, target_window)
+        cfg.window_size = _update("window_size", cfg.window_size, new_window)
+    if cfg.global_tokens <= 0:
+        cfg.global_tokens = max(1, target_window // 512)
+        adjustments.append(f"global_tokens:0->{cfg.global_tokens}")
+    cfg.global_stride = _update(
+        "global_stride",
+        cfg.global_stride,
+        max(cfg.global_stride, max(1, target_window // max(1, cfg.global_tokens))),
+    )
+    cfg.mps_sync_every = _update(
+        "mps_sync_every", cfg.mps_sync_every, max(cfg.mps_sync_every, 64)
+    )
+    cfg.empty_cache_every = _update(
+        "empty_cache_every", cfg.empty_cache_every, max(cfg.empty_cache_every, 128)
+    )
+    cfg.adaptive_micro_recover = _update(
+        "adaptive_micro_recover",
+        cfg.adaptive_micro_recover,
+        max(cfg.adaptive_micro_recover, 512),
+    )
+    cfg.oom_retries = _update(
+        "oom_retries", cfg.oom_retries, max(cfg.oom_retries, 5)
+    )
+    cfg.tiled_q = _update("tiled_q", cfg.tiled_q, max(cfg.tiled_q, 224))
+    cfg.tiled_k = _update("tiled_k", cfg.tiled_k, max(cfg.tiled_k, 384))
+    cfg.loss_guard = _update("loss_guard", cfg.loss_guard, max(cfg.loss_guard, 18.0))
+    cfg.ppl_cap = _update("ppl_cap", cfg.ppl_cap, max(cfg.ppl_cap, 12.0))
+    cfg.ppl_smooth_beta = _update(
+        "ppl_smooth_beta", cfg.ppl_smooth_beta, max(cfg.ppl_smooth_beta, 0.92)
+    )
+    cfg.tps_target = _update("tps_target", cfg.tps_target, max(cfg.tps_target, 200.0))
+    cfg.tps_boost_patience = _update(
+        "tps_boost_patience",
+        cfg.tps_boost_patience,
+        max(cfg.tps_boost_patience, 16),
+    )
+
+    env_updates: Dict[str, Any] = {}
+
+    def _env_default(key: str, val: Any):
+        if os.environ.get(key) is None:
+            os.environ[key] = str(val)
+            env_updates[key] = val
+
+    _env_default("AETHER_MPS_WARMUP_STEPS", 3)
+    _env_default("AETHER_MPS_WARMUP_SIZE", max(1024, target_window))
+    _env_default("AETHER_MPS_WARMUP_HEADS", max(16, getattr(model, "n_heads", 32)))
+    _env_default("AETHER_MPS_WARMUP_SEQ", min(2048, target_window))
+    _env_default("AETHER_MPS_WARMUP_ATTENTION", 1)
+    if os.environ.get("AETHER_MPS_WARMUP_ATTENTION_STEPS") is None:
+        attn_steps = (cfg.mps_sync_every // 16) or 1
+        attn_steps = max(1, min(4, attn_steps))
+        _env_default("AETHER_MPS_WARMUP_ATTENTION_STEPS", attn_steps)
+    head_dim = None
+    if hasattr(model, "head_dim"):
+        try:
+            head_dim = int(getattr(model, "head_dim"))
+        except Exception:
+            head_dim = None
+    if head_dim is None and hasattr(model, "d_model") and getattr(model, "n_heads", 0):
+        try:
+            head_dim = int(getattr(model, "d_model")) // max(1, int(getattr(model, "n_heads")))
+        except Exception:
+            head_dim = None
+    if head_dim is not None and head_dim > 0:
+        _env_default("AETHER_MPS_WARMUP_HEAD_DIM", max(64, head_dim))
+    _env_default("AETHER_MPS_ASYNC", 1)
+    _env_default("AETHER_SDPA_WINDOW", cfg.window_size)
+    _env_default("AETHER_MPS_FLASH_WINDOW", cfg.window_size)
+    _env_default("AETHER_MPS_FLASH_TILE_Q", cfg.tiled_q)
+    _env_default("AETHER_MPS_FLASH_TILE_K", cfg.tiled_k)
+    _env_default("AETHER_MPS_FLASH_GLOBALS", max(0, cfg.global_tokens))
+    _env_default(
+        "AETHER_MPS_FLASH_STRIDE", max(0, cfg.global_stride)
+    )
+    if os.environ.get("AETHER_MPS_FLASH_FP32") is None:
+        _env_default("AETHER_MPS_FLASH_FP32", 1)
+    _env_default("PYTORCH_MPS_HIGH_WATERMARK_RATIO", 0.92)
+
+    rank = cfg.mps_7b_lora_rank or max(16, _AETHER_DEFAULT_LORA_R // 2)
+    alpha = cfg.mps_7b_lora_alpha or max(rank * 2, 64)
+    dropout = float(getattr(cfg, "mps_7b_lora_dropout", 0.05))
+    skip_out = cfg.mps_7b_skip_if_out_equals
+    if skip_out is None and hasattr(model, "vocab_size"):
+        skip_out = int(getattr(model, "vocab_size"))
+    converted = convert_linear_to_int8_lora(
+        model,
+        r=rank,
+        alpha=alpha,
+        dropout=dropout,
+        include_names=None,
+        exclude_names=tuple(getattr(cfg, "mps_7b_int8_exclude", ("emb", "head"))),
+        skip_if_out_equals=skip_out,
+    )
+    if converted > 0:
+        report["int8_lora_converted"] = converted
+        adjustments.append(f"int8_lora:{converted}")
+
+    if env_updates:
+        report["env"] = env_updates
+
+    summary = ", ".join(adjustments) if adjustments else "defaults"
+    print(
+        f"[MPS][7B] auto-tune applied (params≈{total_params/1e9:.2f}B): {summary}"
+    )
+    return report
 
 
 class FabricLite:
@@ -2078,8 +2397,36 @@ class ThroughputMeter:
         return self.value
 
     def reset(self):
+        self.ready = False
+        self.value = 0.0
+
+
+class EMAMeter:
+    def __init__(self, beta: float = 0.95, clamp: Optional[Tuple[float, float]] = None):
+        self.beta = float(beta)
+        self.clamp = clamp
         self.value = 0.0
         self.ready = False
+
+    def update(self, val: float) -> float:
+        if not math.isfinite(val):
+            return self.value if self.ready else 0.0
+        if self.clamp is not None:
+            lo, hi = self.clamp
+            if lo is not None:
+                val = max(lo, val)
+            if hi is not None:
+                val = min(hi, val)
+        if not self.ready:
+            self.value = val
+            self.ready = True
+        else:
+            self.value = self.beta * self.value + (1.0 - self.beta) * val
+        return self.value
+
+    def reset(self):
+        self.ready = False
+        self.value = 0.0
 
 
 class ChronoScheduler:
@@ -2153,13 +2500,8 @@ except Exception:
 
 def apply_peft_lora(
     model: nn.Module,
-<<<<<<< HEAD:Aether_v2_8_5.py
     r: int = _AETHER_DEFAULT_LORA_R,
-    alpha: int = 32,
-=======
-    r: int = 160,
     alpha: int = 320,
->>>>>>> origin/main:Aether_v2_8.py
     dropout: float = 0.05,
     targets: Optional[List[str]] = None,
 ) -> nn.Module:
@@ -2421,6 +2763,8 @@ class AetherTrainerBase:
         self.cfg = cfg
         self.device = detect_device()
 
+        self._mps7b_report = _auto_tune_for_mps_7b(self.model, self.cfg, self.device)
+
         matmul_mode = getattr(self.cfg, "matmul_precision", None)
         if matmul_mode:
             try:
@@ -2465,6 +2809,14 @@ class AetherTrainerBase:
         self._tps_meter = ThroughputMeter(beta=tps_beta)
         self._last_tok_per_sec = 0.0
         self._last_tok_per_sec_ema = 0.0
+        ppl_beta = float(getattr(self.cfg, "ppl_smooth_beta", 0.90))
+        self._ppl_cap = float(getattr(self.cfg, "ppl_cap", 0.0))
+        clamp_hi = self._ppl_cap if self._ppl_cap > 0 else None
+        self._loss_meter = EMAMeter(beta=ppl_beta, clamp=(0.0, clamp_hi))
+        self._loss_guard = float(getattr(self.cfg, "loss_guard", 0.0))
+        self._tps_target = float(getattr(self.cfg, "tps_target", 0.0))
+        self._tps_patience = max(1, int(getattr(self.cfg, "tps_boost_patience", 24)))
+        self._tps_underperf = 0
 
         wd = 0.01
 
@@ -2531,6 +2883,20 @@ class AetherTrainerBase:
         )
         if self._prefetch_to_device:
             print("[MPS] host batch prefetch enabled")
+
+        self._prefetch_stream = None
+        if self.device.type == "mps" and int(
+            os.environ.get("AETHER_MPS_DISABLE_PREFETCH_STREAM", "0")
+        ) != 1:
+            try:
+                stream_ctor = getattr(torch.mps, "Stream", None)
+                stream_ctx = getattr(torch.mps, "stream", None)
+                if stream_ctor is not None and stream_ctx is not None:
+                    self._prefetch_stream = stream_ctor()
+                    print("[MPS] dedicated copy stream ready")
+            except Exception as e:
+                print("[MPS] copy stream unavailable:", e)
+                self._prefetch_stream = None
 
         if self.device.type == "mps" and bool(
             getattr(self.cfg, "disallow_mps_fallback", True)
@@ -2649,6 +3015,93 @@ class AetherTrainerBase:
             for x in os.environ.get("KBRIDGE_TSWEEP", "").split(",")
             if x.strip()
         ]
+
+    def _device_async_copy(self, *batch):
+        if not batch:
+            return tuple(), None
+        if self.device.type != "mps":
+            return tuple(t.to(self.device) for t in batch), None
+        stream = self._prefetch_stream
+        if stream is None:
+            return tuple(t.to(self.device, non_blocking=True) for t in batch), None
+        stream_ctx = getattr(torch.mps, "stream", None)
+        if stream_ctx is None:
+            return tuple(t.to(self.device, non_blocking=True) for t in batch), None
+        with stream_ctx(stream):
+            copied = tuple(t.to(self.device, non_blocking=True) for t in batch)
+        return copied, stream
+
+    def _wait_stream(self, stream):
+        if stream is None or self.device.type != "mps":
+            return
+        current_fn = getattr(torch.mps, "current_stream", None)
+        if callable(current_fn):
+            try:
+                current_fn().wait_stream(stream)
+                return
+            except Exception:
+                pass
+        sync_fn = getattr(torch.mps, "synchronize", None)
+        if callable(sync_fn):
+            try:
+                sync_fn()
+            except Exception:
+                pass
+
+    def _device_sync_copy(self, *batch):
+        tensors, stream = self._device_async_copy(*batch)
+        self._wait_stream(stream)
+        return tensors
+
+    def _stabilize_loss_value(self, loss_avg: float) -> float:
+        guard = max(0.0, self._loss_guard)
+        if not math.isfinite(loss_avg):
+            print("[LOSS] non-finite mean detected; resetting scaler and clamping")
+            if self.scaler is not None:
+                try:
+                    self.scaler = GradScaler()
+                    print("[LOSS] GradScaler reset after NaN loss")
+                except Exception:
+                    pass
+            loss_avg = guard if guard > 0 else 0.0
+        if guard > 0 and loss_avg > guard:
+            print(
+                f"[LOSS] spike detected ({loss_avg:.4f}); clipped to guard {guard:.2f}"
+            )
+            if self.scaler is not None:
+                try:
+                    self.scaler = GradScaler()
+                    print("[LOSS] GradScaler reset after loss spike")
+                except Exception:
+                    pass
+            if hasattr(self, "_ai"):
+                try:
+                    self._ai.skip_next_step = True
+                except Exception:
+                    pass
+            loss_avg = guard
+        return loss_avg
+
+    def _maybe_boost_throughput(self, ema_tps: float):
+        target = max(0.0, self._tps_target)
+        if target <= 0:
+            return
+        if ema_tps >= target * 0.97:
+            self._tps_underperf = 0
+            return
+        self._tps_underperf += 1
+        if self._tps_underperf < self._tps_patience:
+            return
+        self._tps_underperf = 0
+        if not self._adaptive_micro:
+            return
+        if self._micro_active > self._micro_base:
+            new_micro = max(self._micro_base, self._micro_active // 2)
+            if new_micro < self._micro_active:
+                self._micro_active = new_micro
+                print(
+                    f"[THROUGHPUT] micro_batch tightened to {self._micro_active} (ema={ema_tps:.1f} < target={target:.1f})"
+                )
 
     def _rebuild_optimizer(self):
         wd = 0.01
@@ -2842,6 +3295,7 @@ class AetherTrainerMPS(AetherTrainerBase):
         total_steps = self.cfg.max_steps or int(self.cfg.epochs * steps_per_epoch)
         sched = ChronoScheduler(self.opt, self.cfg, total_steps=total_steps)
         self._tps_meter.reset()
+        self._loss_meter.reset()
         self._last_tok_per_sec = 0.0
         self._last_tok_per_sec_ema = 0.0
 
@@ -2883,13 +3337,15 @@ class AetherTrainerMPS(AetherTrainerBase):
                     idx = 0
                     restart_batch = False
                     batch_on_device = None
+                    batch_stream = None
 
                     if self._prefetch_to_device:
                         try:
-                            batch_on_device = (
-                                bx_cpu.to(self.device, non_blocking=True),
-                                by_cpu.to(self.device, non_blocking=True),
+                            tensors, batch_stream = self._device_async_copy(
+                                bx_cpu, by_cpu
                             )
+                            if tensors:
+                                batch_on_device = tuple(tensors)
                         except RuntimeError as e:
                             if self._maybe_handle_oom(e, B * T):
                                 restart_batch = True
@@ -2905,12 +3361,17 @@ class AetherTrainerMPS(AetherTrainerBase):
                                     e,
                                 )
                                 self._prefetch_to_device = False
+                                batch_stream = None
                             batch_on_device = None
 
                     if restart_batch:
                         if self._oom_retry_limit and oom_count > self._oom_retry_limit:
                             raise last_oom_err
                         continue
+
+                    if batch_on_device is not None and batch_stream is not None:
+                        self._wait_stream(batch_stream)
+                        batch_stream = None
 
                     while idx < B:
                         current_micro = max(1, int(self._micro_active))
@@ -2920,11 +3381,8 @@ class AetherTrainerMPS(AetherTrainerBase):
                             subx = batch_on_device[0][idx:end]
                             suby = batch_on_device[1][idx:end]
                         else:
-                            subx = bx_cpu[idx:end].to(
-                                self.device, non_blocking=True
-                            )
-                            suby = by_cpu[idx:end].to(
-                                self.device, non_blocking=True
+                            subx, suby = self._device_sync_copy(
+                                bx_cpu[idx:end], by_cpu[idx:end]
                             )
 
                         # AI pre-forward planning
@@ -3169,12 +3627,19 @@ class AetherTrainerMPS(AetherTrainerBase):
                     except Exception:
                         pass
 
-                loss_avg = total_loss / max(1, total_tok)
-                ppl = math.exp(min(20.0, loss_avg))
+                raw_loss_avg = total_loss / max(1, total_tok)
+                loss_avg = self._stabilize_loss_value(raw_loss_avg)
+                loss_avg = max(0.0, loss_avg)
+                smooth_loss = self._loss_meter.update(loss_avg)
+                ppl_base = smooth_loss
+                if self._ppl_cap > 0:
+                    ppl_base = min(ppl_base, self._ppl_cap)
+                ppl = math.exp(ppl_base)
                 elapsed = time.time() - t0
                 t0 = time.time()
                 tps = float(total_tok) / max(1e-6, elapsed)
                 ema_tps = self._tps_meter.update(total_tok, elapsed)
+                self._maybe_boost_throughput(ema_tps)
                 self._last_tok_per_sec = float(tps)
                 self._last_tok_per_sec_ema = float(ema_tps)
                 lr_mult = sched.step()
@@ -3385,7 +3850,9 @@ class AetherTrainerMPS(AetherTrainerBase):
                     self.fabric.log(
                         {
                             "train/loss": float(loss_avg),
-                            "train/ce": float(loss_avg),
+                            "train/loss_raw": float(raw_loss_avg),
+                            "train/loss_smooth": float(smooth_loss),
+                            "train/ce": float(raw_loss_avg),
                             "train/ppl": float(ppl),
                             "train/tok_s": float(tps),
                             "train/tok_s_ema": float(ema_tps),
@@ -3786,19 +4253,20 @@ def __aether_main__():
     ap.add_argument(
         "--hybrid_lora", action="store_true", help="PEFT + INT8-LoRA hybrid"
     )
-<<<<<<< HEAD:Aether_v2_8_5.py
     ap.add_argument(
         "--lora_r",
         type=int,
         default=_AETHER_DEFAULT_LORA_R,
         help=f"LoRA rank (default: {_AETHER_DEFAULT_LORA_R})",
     )
-    ap.add_argument("--lora_alpha", type=int, default=32)
-=======
-    ap.add_argument("--lora_r", type=int, default=160)
     ap.add_argument("--lora_alpha", type=int, default=320)
->>>>>>> origin/main:Aether_v2_8.py
     ap.add_argument("--lora_dropout", type=float, default=0.05)
+    ap.add_argument("--auto_mps_7b", action="store_true")
+    ap.add_argument("--auto_mps_target_seq", type=int, default=4096)
+    ap.add_argument("--mps_7b_lora_rank", type=int, default=-1)
+    ap.add_argument("--mps_7b_lora_alpha", type=int, default=0)
+    ap.add_argument("--mps_7b_lora_dropout", type=float, default=0.05)
+    ap.add_argument("--mps_7b_skip_if_out_equals", type=int, default=-1)
     ap.add_argument("--save_adapter", type=str, default="")
     # tracing
     ap.add_argument("--ts_trace", action="store_true")
@@ -3931,6 +4399,20 @@ def __aether_main__():
         loader_pin_memory=bool(args.loader_pin_memory),
         prefetch_to_device=not bool(args.no_prefetch_to_device),
         disallow_mps_fallback=not bool(args.allow_mps_cpu_fallback),
+        auto_mps_7b=bool(args.auto_mps_7b),
+        auto_mps_target_seq=int(args.auto_mps_target_seq),
+        mps_7b_lora_rank=(
+            int(args.mps_7b_lora_rank) if int(args.mps_7b_lora_rank) > 0 else None
+        ),
+        mps_7b_lora_alpha=(
+            int(args.mps_7b_lora_alpha) if int(args.mps_7b_lora_alpha) > 0 else None
+        ),
+        mps_7b_lora_dropout=float(args.mps_7b_lora_dropout),
+        mps_7b_skip_if_out_equals=(
+            int(args.mps_7b_skip_if_out_equals)
+            if int(args.mps_7b_skip_if_out_equals) >= 0
+            else getattr(model, "vocab_size", None)
+        ),
     )
     cfg.safetensor_every = int(getattr(args, "safetensor_every", 0))
     cfg.curriculum = [
