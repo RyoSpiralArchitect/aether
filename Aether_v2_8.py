@@ -418,6 +418,10 @@ class FlashAttentionRuntime:
         self._fallbacks = 0
         self._compiled_impl = None
         self._compile_failed = False
+        self._allow_compile = _aos.environ.get("AETHER_FLASH_COMPILE", "0") == "1"
+        self._compile_backend = _aos.environ.get(
+            "AETHER_FLASH_COMPILE_BACKEND", "inductor"
+        )
 
     def _block_sizes(self):
         bq = max(1, int(_aos.environ.get("AETHER_FLASH_BLOCK_Q", "128")))
@@ -487,6 +491,9 @@ class FlashAttentionRuntime:
             if scale_override is not None
             else 1.0 / math.sqrt(max(1, D))
         )
+        scale_tensor = torch.tensor(
+            scale, dtype=torch.float32, device=q.device
+        )
         eps = float(_aos.environ.get("AETHER_FLASH_EPS", self._eps))
         k_t = k.transpose(-1, -2).contiguous()
         q_positions = (
@@ -522,7 +529,7 @@ class FlashAttentionRuntime:
                 j1 = min(j0 + block_k, Tk)
                 k_blk = k_t[:, :, :, j0:j1]
                 scores = torch.matmul(q_blk, k_blk).to(torch.float32)
-                scores.mul_(scale)
+                scores.mul_(scale_tensor)
                 mask_block = None
                 if attn_mask_local is not None:
                     mask_block = self._slice_mask(attn_mask_local, i0, i1, j0, j1)
@@ -560,11 +567,9 @@ class FlashAttentionRuntime:
                     p = p * (keep > dropout_p) / max(1e-6, 1.0 - dropout_p)
                 exp_m = torch.exp(m_i - m_new)
                 l_i = exp_m * l_i + p.sum(dim=-1)
-                o_i = (
-                    exp_m.unsqueeze(-1).to(q.dtype) * o_i
-                    + torch.einsum(
-                        "bhqk,bhkd->bhqd", p.to(q.dtype), v[:, :, j0:j1, :]
-                    )
+                v_blk = v[:, :, j0:j1, :]
+                o_i = exp_m.unsqueeze(-1).to(q.dtype) * o_i + torch.matmul(
+                    p.to(q.dtype), v_blk
                 )
                 m_i = m_new
             denom = l_i.clamp_min(eps).unsqueeze(-1).to(q.dtype)
@@ -591,21 +596,26 @@ class FlashAttentionRuntime:
         scale_override: Optional[float] = None,
     ) -> torch.Tensor:
         impl = self._call_impl
-        if (
-            self.should_use(q)
+        want_compile = (
+            self._allow_compile
+            and self.should_use(q)
             and self._compiled_impl is None
             and not self._compile_failed
             and hasattr(torch, "compile")
-        ):
+        )
+        if want_compile:
             try:
                 self._compiled_impl = torch.compile(
                     self._call_impl,
                     dynamic=True,
-                    backend=_aos.environ.get("AETHER_FLASH_COMPILE_BACKEND", "inductor"),
+                    backend=self._compile_backend,
                 )
                 print("[MPS][FLASH] compiled attention kernel active")
             except Exception:
                 self._compile_failed = True
+                print(
+                    "[MPS][FLASH] compile disabled after failure; using eager attention"
+                )
         if self._compiled_impl is not None and self.should_use(q):
             impl = self._compiled_impl
         return impl(
@@ -2218,6 +2228,9 @@ def _auto_tune_for_mps_7b(
         cfg.loader_prefetch_factor,
         max(cfg.loader_prefetch_factor, 6),
     )
+    cfg.loader_pin_memory = _update(
+        "loader_pin_memory", cfg.loader_pin_memory, True
+    )
     if cfg.loader_num_workers > 0 and not cfg.loader_persistent_workers:
         cfg.loader_persistent_workers = True
         adjustments.append("loader_persistent_workers:False->True")
@@ -2462,6 +2475,15 @@ class PsyAugment:
         self.byte_noise = 0.0
         self.span_mask_prob = 0.0
         self.span_len = 8
+        self._gen = torch.Generator(device="cpu")
+        seed_env = _aos.environ.get("AETHER_PSY_SEED")
+        try:
+            if seed_env is not None:
+                self._gen.manual_seed(int(seed_env))
+            else:
+                self._gen.seed()
+        except Exception:
+            self._gen.seed()
 
     def update(self, token_dropout=0.0, byte_noise=0.0, span_mask_prob=0.0, span_len=8):
         self.token_dropout = float(token_dropout)
@@ -2480,8 +2502,12 @@ class PsyAugment:
         B, T = x.shape
         x = x.clone()
         if self.token_dropout > 0:
-            m = torch.rand_like(x.to(torch.float32)) < self.token_dropout
-            x.masked_fill_(m.to(torch.bool), pad_id)
+            mask = torch.rand_like(
+                x,
+                dtype=torch.float32,
+                generator=self._gen,
+            ) < self.token_dropout
+            x.masked_fill_(mask, pad_id)
         # byte_noise / span_mask は必要なら追加
         return x
 
@@ -2817,6 +2843,12 @@ class AetherTrainerBase:
         self._tps_target = float(getattr(self.cfg, "tps_target", 0.0))
         self._tps_patience = max(1, int(getattr(self.cfg, "tps_boost_patience", 24)))
         self._tps_underperf = 0
+        try:
+            spike_patience = int(_aos.environ.get("AETHER_LOSS_SPIKE_PATIENCE", "4"))
+        except Exception:
+            spike_patience = 4
+        self._loss_spike_count = 0
+        self._loss_spike_patience = max(1, spike_patience)
 
         wd = 0.01
 
@@ -3065,21 +3097,40 @@ class AetherTrainerBase:
                     pass
             loss_avg = guard if guard > 0 else 0.0
         if guard > 0 and loss_avg > guard:
+            self._loss_spike_count += 1
             print(
                 f"[LOSS] spike detected ({loss_avg:.4f}); clipped to guard {guard:.2f}"
             )
+            reset_msg = "[LOSS] GradScaler reset after loss spike"
+            repeated = False
+            if self._loss_spike_count >= self._loss_spike_patience:
+                repeated = True
+                reset_msg = "[LOSS] GradScaler reset after repeated spikes"
             if self.scaler is not None:
                 try:
                     self.scaler = GradScaler()
-                    print("[LOSS] GradScaler reset after loss spike")
+                    print(reset_msg)
                 except Exception:
                     pass
+            if repeated and getattr(self, "_adaptive_micro", False):
+                if self._micro_active < self._micro_cap:
+                    prev = self._micro_active
+                    self._micro_active = min(
+                        self._micro_cap, max(prev + 1, prev * 2)
+                    )
+                    print(
+                        "[LOSS] repeated spikes -> micro_batch raised to"
+                        f" {self._micro_active}"
+                    )
+                self._loss_spike_count = 0
             if hasattr(self, "_ai"):
                 try:
                     self._ai.skip_next_step = True
                 except Exception:
                     pass
             loss_avg = guard
+        else:
+            self._loss_spike_count = 0
         return loss_avg
 
     def _maybe_boost_throughput(self, ema_tps: float):
@@ -3300,25 +3351,59 @@ class AetherTrainerMPS(AetherTrainerBase):
         self._last_tok_per_sec_ema = 0.0
 
         pad_id = self.tok.PAD
+
+        def _schedule_batch(loader_iter, step_hint: int):
+            try:
+                bx, by = next(loader_iter)
+            except StopIteration:
+                return None
+            params = curr_params(int(step_hint))
+            max_len = int(params.get("max_len", bx.size(1)))
+            if max_len < bx.size(1):
+                bx = bx[:, :max_len]
+                by = by[:, :max_len]
+            self.psy.update(
+                token_dropout=self.cfg.token_dropout,
+                byte_noise=self.cfg.byte_noise,
+                span_mask_prob=self.cfg.span_mask_prob,
+                span_len=self.cfg.span_mask_len,
+            )
+            bx = self.psy.apply_input(bx, pad_id)
+            device_payload = None
+            stream_payload = None
+            if self._prefetch_to_device:
+                try:
+                    tensors, stream_payload = self._device_async_copy(bx, by)
+                    if tensors:
+                        device_payload = tuple(tensors)
+                except RuntimeError as e:
+                    print("[MPS] host batch prefetch disabled after error:", e)
+                    self._prefetch_to_device = False
+                    self._prefetch_stream = None
+                    device_payload = None
+                    stream_payload = None
+            return {
+                "cpu": (bx, by),
+                "device": device_payload,
+                "stream": stream_payload,
+            }
+
         self.model.train()
         t0 = time.time()
         step = self._global_step
         for epoch in range(self.cfg.epochs if self.cfg.max_steps is None else 10**9):
-            for bx, by in train_dl:
-                p = curr_params(step + 1)
-                if p["max_len"] < bx.size(1):
-                    bx = bx[:, : p["max_len"]]
-                    by = by[:, : p["max_len"]]
+            loader_iter = iter(train_dl)
+            pending = _schedule_batch(loader_iter, step + 1)
+            while pending is not None:
+                if self.cfg.max_steps is not None and step >= self.cfg.max_steps:
+                    break
+                next_pending = None
+                if self.cfg.max_steps is None or (step + 1) < self.cfg.max_steps:
+                    next_pending = _schedule_batch(loader_iter, step + 2)
 
-                self.psy.update(
-                    token_dropout=self.cfg.token_dropout,
-                    byte_noise=self.cfg.byte_noise,
-                    span_mask_prob=self.cfg.span_mask_prob,
-                    span_len=self.cfg.span_mask_len,
-                )
-                bx = self.psy.apply_input(bx, pad_id)
+                bx_cpu, by_cpu = pending["cpu"]
 
-                B, T = bx.shape
+                B, T = bx_cpu.shape
                 total_loss, total_tok = 0.0, 0
                 accum = 0
                 logits = None
@@ -3328,7 +3413,9 @@ class AetherTrainerMPS(AetherTrainerBase):
                 }
                 oom_count = 0
                 last_oom_err = None
-                bx_cpu, by_cpu = bx, by
+                device_cache = pending["device"]
+                device_stream = pending["stream"]
+                stream_waited = False
 
                 while True:
                     total_loss = 0.0
@@ -3336,16 +3423,22 @@ class AetherTrainerMPS(AetherTrainerBase):
                     accum = 0
                     idx = 0
                     restart_batch = False
-                    batch_on_device = None
+                    batch_on_device = device_cache
                     batch_stream = None
+                    if batch_on_device is not None and not stream_waited:
+                        batch_stream = device_stream
 
-                    if self._prefetch_to_device:
+                    if batch_on_device is None and self._prefetch_to_device:
                         try:
-                            tensors, batch_stream = self._device_async_copy(
+                            tensors, new_stream = self._device_async_copy(
                                 bx_cpu, by_cpu
                             )
                             if tensors:
                                 batch_on_device = tuple(tensors)
+                                device_cache = batch_on_device
+                                device_stream = new_stream
+                                stream_waited = False
+                                batch_stream = new_stream
                         except RuntimeError as e:
                             if self._maybe_handle_oom(e, B * T):
                                 restart_batch = True
@@ -3361,7 +3454,10 @@ class AetherTrainerMPS(AetherTrainerBase):
                                     e,
                                 )
                                 self._prefetch_to_device = False
+                                self._prefetch_stream = None
                                 batch_stream = None
+                                device_cache = None
+                                device_stream = None
                             batch_on_device = None
 
                     if restart_batch:
@@ -3371,6 +3467,7 @@ class AetherTrainerMPS(AetherTrainerBase):
 
                     if batch_on_device is not None and batch_stream is not None:
                         self._wait_stream(batch_stream)
+                        stream_waited = True
                         batch_stream = None
 
                     while idx < B:
@@ -4071,8 +4168,9 @@ class AetherTrainerMPS(AetherTrainerBase):
                             self._kb_seq_gains.clear()
                         except Exception:
                             pass
-                    if self.cfg.max_steps and step >= self.cfg.max_steps:
-                        break
+                pending = next_pending
+                if self.cfg.max_steps and step >= self.cfg.max_steps:
+                    break
             if self.cfg.max_steps and step >= self.cfg.max_steps:
                 break
 
