@@ -1516,6 +1516,8 @@ def convert_linear_to_int8_lora(
 ) -> int:
     n = 0
     for name, m in list(model.named_modules()):
+        if isinstance(m, (LinearInt8LoRA, LinearInt8Base)):
+            continue
         if isinstance(m, nn.Linear):
             if getattr(m, "in_features", 1) == 0 or getattr(m, "out_features", 1) == 0:
                 print(
@@ -1544,6 +1546,10 @@ def convert_linear_to_int8_lora(
                 dropout=dropout,
                 bias=(b is not None),
             )
+            try:
+                q = q.to(w.device)
+            except Exception:
+                pass
             q.base.load_from_float(w, b)
             # replace in parent
             parent = model
@@ -2108,12 +2114,16 @@ def _auto_tune_for_mps_7b(
     cfg.loader_prefetch_factor = _update(
         "loader_prefetch_factor",
         cfg.loader_prefetch_factor,
-        max(cfg.loader_prefetch_factor, 4),
+        max(cfg.loader_prefetch_factor, 6),
     )
     if cfg.loader_num_workers > 0 and not cfg.loader_persistent_workers:
         cfg.loader_persistent_workers = True
         adjustments.append("loader_persistent_workers:False->True")
         report["loader_persistent_workers"] = {"old": False, "new": True}
+    if not cfg.loader_pin_memory:
+        cfg.loader_pin_memory = True
+        adjustments.append("loader_pin_memory:False->True")
+        report["loader_pin_memory"] = {"old": False, "new": True}
     if not cfg.prefetch_to_device:
         cfg.prefetch_to_device = True
         adjustments.append("prefetch_to_device:False->True")
@@ -2152,6 +2162,14 @@ def _auto_tune_for_mps_7b(
     cfg.empty_cache_every = _update(
         "empty_cache_every", cfg.empty_cache_every, max(cfg.empty_cache_every, 128)
     )
+    cfg.adaptive_micro_recover = _update(
+        "adaptive_micro_recover",
+        cfg.adaptive_micro_recover,
+        max(cfg.adaptive_micro_recover, 512),
+    )
+    cfg.oom_retries = _update(
+        "oom_retries", cfg.oom_retries, max(cfg.oom_retries, 5)
+    )
 
     env_updates: Dict[str, Any] = {}
 
@@ -2164,8 +2182,36 @@ def _auto_tune_for_mps_7b(
     _env_default("AETHER_MPS_WARMUP_SIZE", max(1024, target_window))
     _env_default("AETHER_MPS_WARMUP_HEADS", max(16, getattr(model, "n_heads", 32)))
     _env_default("AETHER_MPS_WARMUP_SEQ", min(2048, target_window))
+    _env_default("AETHER_MPS_WARMUP_ATTENTION", 1)
+    if os.environ.get("AETHER_MPS_WARMUP_ATTENTION_STEPS") is None:
+        attn_steps = (cfg.mps_sync_every // 16) or 1
+        attn_steps = max(1, min(4, attn_steps))
+        _env_default("AETHER_MPS_WARMUP_ATTENTION_STEPS", attn_steps)
+    head_dim = None
+    if hasattr(model, "head_dim"):
+        try:
+            head_dim = int(getattr(model, "head_dim"))
+        except Exception:
+            head_dim = None
+    if head_dim is None and hasattr(model, "d_model") and getattr(model, "n_heads", 0):
+        try:
+            head_dim = int(getattr(model, "d_model")) // max(1, int(getattr(model, "n_heads")))
+        except Exception:
+            head_dim = None
+    if head_dim is not None and head_dim > 0:
+        _env_default("AETHER_MPS_WARMUP_HEAD_DIM", max(64, head_dim))
     _env_default("AETHER_MPS_ASYNC", 1)
     _env_default("AETHER_SDPA_WINDOW", cfg.window_size)
+    _env_default("AETHER_MPS_FLASH_WINDOW", cfg.window_size)
+    _env_default("AETHER_MPS_FLASH_TILE_Q", cfg.tiled_q)
+    _env_default("AETHER_MPS_FLASH_TILE_K", cfg.tiled_k)
+    _env_default("AETHER_MPS_FLASH_GLOBALS", max(0, cfg.global_tokens))
+    _env_default(
+        "AETHER_MPS_FLASH_STRIDE", max(0, cfg.global_stride)
+    )
+    if os.environ.get("AETHER_MPS_FLASH_FP32") is None:
+        _env_default("AETHER_MPS_FLASH_FP32", 1)
+    _env_default("PYTORCH_MPS_HIGH_WATERMARK_RATIO", 0.92)
 
     rank = cfg.mps_7b_lora_rank or max(16, _AETHER_DEFAULT_LORA_R // 2)
     alpha = cfg.mps_7b_lora_alpha or max(rank * 2, 64)
@@ -2689,6 +2735,20 @@ class AetherTrainerBase:
         if self._prefetch_to_device:
             print("[MPS] host batch prefetch enabled")
 
+        self._prefetch_stream = None
+        if self.device.type == "mps" and int(
+            os.environ.get("AETHER_MPS_DISABLE_PREFETCH_STREAM", "0")
+        ) != 1:
+            try:
+                stream_ctor = getattr(torch.mps, "Stream", None)
+                stream_ctx = getattr(torch.mps, "stream", None)
+                if stream_ctor is not None and stream_ctx is not None:
+                    self._prefetch_stream = stream_ctor()
+                    print("[MPS] dedicated copy stream ready")
+            except Exception as e:
+                print("[MPS] copy stream unavailable:", e)
+                self._prefetch_stream = None
+
         if self.device.type == "mps" and bool(
             getattr(self.cfg, "disallow_mps_fallback", True)
         ):
@@ -2806,6 +2866,43 @@ class AetherTrainerBase:
             for x in os.environ.get("KBRIDGE_TSWEEP", "").split(",")
             if x.strip()
         ]
+
+    def _device_async_copy(self, *batch):
+        if not batch:
+            return tuple(), None
+        if self.device.type != "mps":
+            return tuple(t.to(self.device) for t in batch), None
+        stream = self._prefetch_stream
+        if stream is None:
+            return tuple(t.to(self.device, non_blocking=True) for t in batch), None
+        stream_ctx = getattr(torch.mps, "stream", None)
+        if stream_ctx is None:
+            return tuple(t.to(self.device, non_blocking=True) for t in batch), None
+        with stream_ctx(stream):
+            copied = tuple(t.to(self.device, non_blocking=True) for t in batch)
+        return copied, stream
+
+    def _wait_stream(self, stream):
+        if stream is None or self.device.type != "mps":
+            return
+        current_fn = getattr(torch.mps, "current_stream", None)
+        if callable(current_fn):
+            try:
+                current_fn().wait_stream(stream)
+                return
+            except Exception:
+                pass
+        sync_fn = getattr(torch.mps, "synchronize", None)
+        if callable(sync_fn):
+            try:
+                sync_fn()
+            except Exception:
+                pass
+
+    def _device_sync_copy(self, *batch):
+        tensors, stream = self._device_async_copy(*batch)
+        self._wait_stream(stream)
+        return tensors
 
     def _rebuild_optimizer(self):
         wd = 0.01
@@ -3040,13 +3137,15 @@ class AetherTrainerMPS(AetherTrainerBase):
                     idx = 0
                     restart_batch = False
                     batch_on_device = None
+                    batch_stream = None
 
                     if self._prefetch_to_device:
                         try:
-                            batch_on_device = (
-                                bx_cpu.to(self.device, non_blocking=True),
-                                by_cpu.to(self.device, non_blocking=True),
+                            tensors, batch_stream = self._device_async_copy(
+                                bx_cpu, by_cpu
                             )
+                            if tensors:
+                                batch_on_device = tuple(tensors)
                         except RuntimeError as e:
                             if self._maybe_handle_oom(e, B * T):
                                 restart_batch = True
@@ -3062,12 +3161,17 @@ class AetherTrainerMPS(AetherTrainerBase):
                                     e,
                                 )
                                 self._prefetch_to_device = False
+                                batch_stream = None
                             batch_on_device = None
 
                     if restart_batch:
                         if self._oom_retry_limit and oom_count > self._oom_retry_limit:
                             raise last_oom_err
                         continue
+
+                    if batch_on_device is not None and batch_stream is not None:
+                        self._wait_stream(batch_stream)
+                        batch_stream = None
 
                     while idx < B:
                         current_micro = max(1, int(self._micro_active))
@@ -3077,11 +3181,8 @@ class AetherTrainerMPS(AetherTrainerBase):
                             subx = batch_on_device[0][idx:end]
                             suby = batch_on_device[1][idx:end]
                         else:
-                            subx = bx_cpu[idx:end].to(
-                                self.device, non_blocking=True
-                            )
-                            suby = by_cpu[idx:end].to(
-                                self.device, non_blocking=True
+                            subx, suby = self._device_sync_copy(
+                                bx_cpu[idx:end], by_cpu[idx:end]
                             )
 
                         # AI pre-forward planning
