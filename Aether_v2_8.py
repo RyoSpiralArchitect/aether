@@ -1476,20 +1476,28 @@ class LinearInt8LoRA(nn.Module):
         self,
         in_f,
         out_f,
-        r: int = _AETHER_DEFAULT_LORA_R,
-        alpha: int = 32,
+        r: Optional[int] = None,
+        alpha: Optional[int] = None,
         dropout: float = 0.0,
         bias: bool = False,
     ):
-
-    def __init__(self, in_f, out_f, r=160, alpha=320, dropout=0.0, bias=False):
-        origin/main:Aether_v2_8.py
         super().__init__()
+        rank = _AETHER_DEFAULT_LORA_R if r is None else int(r)
+        if rank <= 0:
+            raise ValueError("LoRA rank must be > 0")
+        alpha_val = alpha if alpha is not None else max(1, rank * 2)
+        self.rank = rank
+        self.alpha = int(alpha_val)
         self.base = LinearInt8Base(in_f, out_f, bias=bias)
-        self.lora_A = nn.Linear(in_f, r, bias=False)
-        self.lora_B = nn.Linear(r, out_f, bias=False)
-        self.scal = float(alpha / max(1, r))
+        self.lora_A = nn.Linear(in_f, rank, bias=False)
+        self.lora_B = nn.Linear(rank, out_f, bias=False)
+        self.scal = float(self.alpha / max(1, rank))
         self.drop = nn.Dropout(dropout)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
 
     def forward(self, x):
         y = self.base(x)
@@ -1514,6 +1522,11 @@ def convert_linear_to_int8_lora(
                     f"[INT8-LoRA] skip zero-sized Linear: {name} in={getattr(m, 'in_features', None)} out={getattr(m, 'out_features', None)}"
                 )
                 continue
+            if (
+                skip_if_out_equals is not None
+                and getattr(m, "out_features", None) == skip_if_out_equals
+            ):
+                continue
             if include_names is not None and not any(
                 (inc in name) for inc in include_names
             ):
@@ -1524,7 +1537,12 @@ def convert_linear_to_int8_lora(
             w = p[0].detach().to(torch.float32)
             b = p[1].detach() if (len(p) > 1 and p[1] is not None) else None
             q = LinearInt8LoRA(
-                m.in_features, m.out_features, r, alpha, dropout, bias=(b is not None)
+                m.in_features,
+                m.out_features,
+                r=r,
+                alpha=alpha,
+                dropout=dropout,
+                bias=(b is not None),
             )
             q.base.load_from_float(w, b)
             # replace in parent
@@ -2034,6 +2052,148 @@ class TrainConfig:
     loader_pin_memory: bool = False
     prefetch_to_device: bool = True
     disallow_mps_fallback: bool = True
+    auto_mps_7b: bool = False
+    auto_mps_param_threshold: int = 5_000_000_000
+    auto_mps_target_seq: int = 4096
+    mps_7b_lora_rank: Optional[int] = None
+    mps_7b_lora_alpha: Optional[int] = None
+    mps_7b_lora_dropout: float = 0.05
+    mps_7b_int8_exclude: Tuple[str, ...] = ("emb", "head")
+    mps_7b_skip_if_out_equals: Optional[int] = None
+
+
+def _auto_tune_for_mps_7b(
+    model: nn.Module, cfg: TrainConfig, device: torch.device
+) -> Dict[str, Any]:
+    report: Dict[str, Any] = {}
+    if not getattr(cfg, "auto_mps_7b", False):
+        return report
+    if getattr(cfg, "_auto_mps_7b_done", False):
+        return report
+    cfg._auto_mps_7b_done = True  # type: ignore[attr-defined]
+    total_params = int(sum(p.numel() for p in model.parameters()))
+    report["params"] = total_params
+    if device.type != "mps":
+        report["skipped"] = "non_mps_device"
+        print("[MPS][7B] auto-tune skipped: device is not MPS")
+        return report
+    threshold = int(getattr(cfg, "auto_mps_param_threshold", 5_000_000_000))
+    if total_params < threshold:
+        report["skipped"] = "below_threshold"
+        print(
+            f"[MPS][7B] auto-tune skipped: params={total_params:,} < threshold={threshold:,}"
+        )
+        return report
+
+    adjustments: List[str] = []
+
+    def _update(name: str, current, new_val):
+        if current != new_val:
+            adjustments.append(f"{name}:{current}->{new_val}")
+            report[name] = {"old": current, "new": new_val}
+        return new_val
+
+    cfg.batch_size = _update("batch_size", cfg.batch_size, max(1, min(cfg.batch_size, 2)))
+    cfg.micro_batch = _update(
+        "micro_batch", cfg.micro_batch, max(1, min(cfg.micro_batch, cfg.batch_size))
+    )
+    cfg.adaptive_micro_max = _update(
+        "adaptive_micro_max",
+        cfg.adaptive_micro_max,
+        max(cfg.adaptive_micro_max, cfg.micro_batch * 4),
+    )
+    cfg.loader_num_workers = _update(
+        "loader_num_workers", cfg.loader_num_workers, max(cfg.loader_num_workers, 2)
+    )
+    cfg.loader_prefetch_factor = _update(
+        "loader_prefetch_factor",
+        cfg.loader_prefetch_factor,
+        max(cfg.loader_prefetch_factor, 4),
+    )
+    if cfg.loader_num_workers > 0 and not cfg.loader_persistent_workers:
+        cfg.loader_persistent_workers = True
+        adjustments.append("loader_persistent_workers:False->True")
+        report["loader_persistent_workers"] = {"old": False, "new": True}
+    if not cfg.prefetch_to_device:
+        cfg.prefetch_to_device = True
+        adjustments.append("prefetch_to_device:False->True")
+    if not cfg.disallow_mps_fallback:
+        cfg.disallow_mps_fallback = True
+        adjustments.append("disallow_mps_fallback:False->True")
+    if not cfg.grad_scaler:
+        cfg.grad_scaler = True
+        adjustments.append("grad_scaler:False->True")
+    if not cfg.prefer_bfloat16:
+        cfg.prefer_bfloat16 = True
+        adjustments.append("prefer_bfloat16:False->True")
+    matmul_mode = getattr(cfg, "matmul_precision", None)
+    if not matmul_mode:
+        cfg.matmul_precision = "high"
+        adjustments.append("matmul_precision:None->high")
+        report["matmul_precision"] = {"old": None, "new": "high"}
+    target_window = int(getattr(cfg, "auto_mps_target_seq", 4096))
+    if target_window > 0:
+        new_window = cfg.window_size if cfg.window_size > 0 else target_window
+        new_window = max(new_window, target_window)
+        cfg.window_size = _update("window_size", cfg.window_size, new_window)
+    cfg.tiled_q = _update("tiled_q", cfg.tiled_q, max(cfg.tiled_q, 256))
+    cfg.tiled_k = _update("tiled_k", cfg.tiled_k, max(cfg.tiled_k, 384))
+    if cfg.global_tokens <= 0:
+        cfg.global_tokens = max(1, target_window // 512)
+        adjustments.append(f"global_tokens:0->{cfg.global_tokens}")
+    cfg.global_stride = _update(
+        "global_stride",
+        cfg.global_stride,
+        max(cfg.global_stride, max(1, target_window // max(1, cfg.global_tokens))),
+    )
+    cfg.mps_sync_every = _update(
+        "mps_sync_every", cfg.mps_sync_every, max(cfg.mps_sync_every, 64)
+    )
+    cfg.empty_cache_every = _update(
+        "empty_cache_every", cfg.empty_cache_every, max(cfg.empty_cache_every, 128)
+    )
+
+    env_updates: Dict[str, Any] = {}
+
+    def _env_default(key: str, val: Any):
+        if os.environ.get(key) is None:
+            os.environ[key] = str(val)
+            env_updates[key] = val
+
+    _env_default("AETHER_MPS_WARMUP_STEPS", 3)
+    _env_default("AETHER_MPS_WARMUP_SIZE", max(1024, target_window))
+    _env_default("AETHER_MPS_WARMUP_HEADS", max(16, getattr(model, "n_heads", 32)))
+    _env_default("AETHER_MPS_WARMUP_SEQ", min(2048, target_window))
+    _env_default("AETHER_MPS_ASYNC", 1)
+    _env_default("AETHER_SDPA_WINDOW", cfg.window_size)
+
+    rank = cfg.mps_7b_lora_rank or max(16, _AETHER_DEFAULT_LORA_R // 2)
+    alpha = cfg.mps_7b_lora_alpha or max(rank * 2, 64)
+    dropout = float(getattr(cfg, "mps_7b_lora_dropout", 0.05))
+    skip_out = cfg.mps_7b_skip_if_out_equals
+    if skip_out is None and hasattr(model, "vocab_size"):
+        skip_out = int(getattr(model, "vocab_size"))
+    converted = convert_linear_to_int8_lora(
+        model,
+        r=rank,
+        alpha=alpha,
+        dropout=dropout,
+        include_names=None,
+        exclude_names=tuple(getattr(cfg, "mps_7b_int8_exclude", ("emb", "head"))),
+        skip_if_out_equals=skip_out,
+    )
+    if converted > 0:
+        report["int8_lora_converted"] = converted
+        adjustments.append(f"int8_lora:{converted}")
+
+    if env_updates:
+        report["env"] = env_updates
+
+    summary = ", ".join(adjustments) if adjustments else "defaults"
+    print(
+        f"[MPS][7B] auto-tune applied (params≈{total_params/1e9:.2f}B): {summary}"
+    )
+    return report
 
 
 class FabricLite:
@@ -2153,13 +2313,8 @@ except Exception:
 
 def apply_peft_lora(
     model: nn.Module,
-<<<<<<< HEAD:Aether_v2_8_5.py
     r: int = _AETHER_DEFAULT_LORA_R,
-    alpha: int = 32,
-=======
-    r: int = 160,
     alpha: int = 320,
->>>>>>> origin/main:Aether_v2_8.py
     dropout: float = 0.05,
     targets: Optional[List[str]] = None,
 ) -> nn.Module:
@@ -2420,6 +2575,8 @@ class AetherTrainerBase:
         self.tok = tok
         self.cfg = cfg
         self.device = detect_device()
+
+        self._mps7b_report = _auto_tune_for_mps_7b(self.model, self.cfg, self.device)
 
         matmul_mode = getattr(self.cfg, "matmul_precision", None)
         if matmul_mode:
@@ -3786,19 +3943,20 @@ def __aether_main__():
     ap.add_argument(
         "--hybrid_lora", action="store_true", help="PEFT + INT8-LoRA hybrid"
     )
-<<<<<<< HEAD:Aether_v2_8_5.py
     ap.add_argument(
         "--lora_r",
         type=int,
         default=_AETHER_DEFAULT_LORA_R,
         help=f"LoRA rank (default: {_AETHER_DEFAULT_LORA_R})",
     )
-    ap.add_argument("--lora_alpha", type=int, default=32)
-=======
-    ap.add_argument("--lora_r", type=int, default=160)
     ap.add_argument("--lora_alpha", type=int, default=320)
->>>>>>> origin/main:Aether_v2_8.py
     ap.add_argument("--lora_dropout", type=float, default=0.05)
+    ap.add_argument("--auto_mps_7b", action="store_true")
+    ap.add_argument("--auto_mps_target_seq", type=int, default=4096)
+    ap.add_argument("--mps_7b_lora_rank", type=int, default=-1)
+    ap.add_argument("--mps_7b_lora_alpha", type=int, default=0)
+    ap.add_argument("--mps_7b_lora_dropout", type=float, default=0.05)
+    ap.add_argument("--mps_7b_skip_if_out_equals", type=int, default=-1)
     ap.add_argument("--save_adapter", type=str, default="")
     # tracing
     ap.add_argument("--ts_trace", action="store_true")
@@ -3931,6 +4089,20 @@ def __aether_main__():
         loader_pin_memory=bool(args.loader_pin_memory),
         prefetch_to_device=not bool(args.no_prefetch_to_device),
         disallow_mps_fallback=not bool(args.allow_mps_cpu_fallback),
+        auto_mps_7b=bool(args.auto_mps_7b),
+        auto_mps_target_seq=int(args.auto_mps_target_seq),
+        mps_7b_lora_rank=(
+            int(args.mps_7b_lora_rank) if int(args.mps_7b_lora_rank) > 0 else None
+        ),
+        mps_7b_lora_alpha=(
+            int(args.mps_7b_lora_alpha) if int(args.mps_7b_lora_alpha) > 0 else None
+        ),
+        mps_7b_lora_dropout=float(args.mps_7b_lora_dropout),
+        mps_7b_skip_if_out_equals=(
+            int(args.mps_7b_skip_if_out_equals)
+            if int(args.mps_7b_skip_if_out_equals) >= 0
+            else getattr(model, "vocab_size", None)
+        ),
     )
     cfg.safetensor_every = int(getattr(args, "safetensor_every", 0))
     cfg.curriculum = [
