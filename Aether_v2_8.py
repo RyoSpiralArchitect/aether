@@ -416,6 +416,8 @@ class FlashAttentionRuntime:
     def __init__(self):
         self._eps = 1e-6
         self._fallbacks = 0
+        self._compiled_impl = None
+        self._compile_failed = False
 
     def _block_sizes(self):
         bq = max(1, int(_aos.environ.get("AETHER_FLASH_BLOCK_Q", "128")))
@@ -464,12 +466,11 @@ class FlashAttentionRuntime:
         key_block = (~key_valid).view(key_valid.shape[0], 1, 1, key_valid.shape[1])
         return key_block.expand(-1, 1, i1 - i0, -1).to(device)
 
-    def __call__(
+    def _call_impl(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        *,
         pad_mask: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
         dropout_p: float = 0.0,
@@ -480,36 +481,54 @@ class FlashAttentionRuntime:
         B, H, Tq, D = q.shape
         Tk = k.shape[2]
         block_q, block_k = self._block_sizes()
-        out = torch.zeros((B, H, Tq, D), dtype=q.dtype, device=q.device)
+        out = torch.empty((B, H, Tq, D), dtype=q.dtype, device=q.device)
         scale = (
             float(scale_override)
             if scale_override is not None
             else 1.0 / math.sqrt(max(1, D))
         )
         eps = float(_aos.environ.get("AETHER_FLASH_EPS", self._eps))
+        k_t = k.transpose(-1, -2).contiguous()
+        q_positions = (
+            torch.arange(Tq, device=q.device, dtype=torch.int32)
+            if is_causal
+            else None
+        )
+        k_positions = (
+            torch.arange(Tk, device=q.device, dtype=torch.int32)
+            if is_causal
+            else None
+        )
+        pad_mask_bool = None
+        if pad_mask is not None:
+            pad_mask_bool = pad_mask.to(torch.bool)
+        attn_mask_local = attn_mask
         for i0 in range(0, Tq, block_q):
             i1 = min(i0 + block_q, Tq)
             q_blk = q[:, :, i0:i1, :]
+            blk_len = q_blk.shape[2]
             q_pos = None
-            if is_causal:
-                q_pos = torch.arange(i0, i1, device=q.device)
+            if is_causal and q_positions is not None:
+                q_pos = q_positions[i0:i1].to(q.device)
             m_i = torch.full(
-                (B, H, i1 - i0), float("-inf"), dtype=torch.float32, device=q.device
+                (B, H, blk_len),
+                -1e9,
+                dtype=torch.float32,
+                device=q.device,
             )
-            l_i = torch.zeros((B, H, i1 - i0), dtype=torch.float32, device=q.device)
-            o_i = torch.zeros((B, H, i1 - i0, D), dtype=q.dtype, device=q.device)
+            l_i = torch.zeros((B, H, blk_len), dtype=torch.float32, device=q.device)
+            o_i = torch.zeros((B, H, blk_len, D), dtype=q.dtype, device=q.device)
             for j0 in range(0, Tk, block_k):
                 j1 = min(j0 + block_k, Tk)
-                scores = torch.einsum(
-                    "bhqd,bhkd->bhqk", q_blk, k[:, :, j0:j1, :]
-                ).to(torch.float32)
+                k_blk = k_t[:, :, :, j0:j1]
+                scores = torch.matmul(q_blk, k_blk).to(torch.float32)
                 scores.mul_(scale)
                 mask_block = None
-                if attn_mask is not None:
-                    mask_block = self._slice_mask(attn_mask, i0, i1, j0, j1)
+                if attn_mask_local is not None:
+                    mask_block = self._slice_mask(attn_mask_local, i0, i1, j0, j1)
                 if mask_block is None:
                     mask_block = self._pad_mask_slice(
-                        pad_mask, i0, i1, j0, j1, scores.device
+                        pad_mask_bool, i0, i1, j0, j1, scores.device
                     )
                 if mask_block is not None:
                     if mask_block.dtype == torch.bool:
@@ -518,8 +537,8 @@ class FlashAttentionRuntime:
                         scores = scores + mask_block.to(scores.dtype)
                 if is_causal:
                     if q_pos is None:
-                        q_pos = torch.arange(i0, i1, device=q.device)
-                    k_pos = torch.arange(j0, j1, device=q.device)
+                        q_pos = q_positions[i0:i1].to(q.device)
+                    k_pos = k_positions[j0:j1].to(q.device)
                     causal = k_pos.view(1, 1, 1, -1) > q_pos.view(1, 1, -1, 1)
                     scores = scores.masked_fill(causal, float("-inf"))
                 block_max = torch.max(scores, dim=-1).values
@@ -550,13 +569,56 @@ class FlashAttentionRuntime:
                 m_i = m_new
             denom = l_i.clamp_min(eps).unsqueeze(-1).to(q.dtype)
             o_blk = o_i / denom
-            if pad_mask is not None:
-                valid = pad_mask[:, i0:i1]
+            if pad_mask_bool is not None:
+                valid = pad_mask_bool[:, i0:i1]
                 if valid.dtype != torch.bool:
                     valid = valid.to(torch.bool)
                 o_blk = o_blk * valid.view(B, 1, i1 - i0, 1)
             out[:, :, i0:i1, :] = o_blk
         return out
+
+    def __call__(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        pad_mask: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
+        dropout_p: float = 0.0,
+        is_causal: bool = True,
+        training: bool = False,
+        scale_override: Optional[float] = None,
+    ) -> torch.Tensor:
+        impl = self._call_impl
+        if (
+            self.should_use(q)
+            and self._compiled_impl is None
+            and not self._compile_failed
+            and hasattr(torch, "compile")
+        ):
+            try:
+                self._compiled_impl = torch.compile(
+                    self._call_impl,
+                    dynamic=True,
+                    backend=_aos.environ.get("AETHER_FLASH_COMPILE_BACKEND", "inductor"),
+                )
+                print("[MPS][FLASH] compiled attention kernel active")
+            except Exception:
+                self._compile_failed = True
+        if self._compiled_impl is not None and self.should_use(q):
+            impl = self._compiled_impl
+        return impl(
+            q,
+            k,
+            v,
+            pad_mask=pad_mask,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+            training=training,
+            scale_override=scale_override,
+        )
 
 
 _FLASH_ATTENTION = FlashAttentionRuntime()
@@ -2045,6 +2107,11 @@ class TrainConfig:
     tiled_q: int = 192
     tiled_k: int = 320
     mps_sync_every: int = 0
+    loss_guard: float = 16.0
+    ppl_cap: float = 12.0
+    ppl_smooth_beta: float = 0.90
+    tps_target: float = 0.0
+    tps_boost_patience: int = 24
     # LVI regs / switches
     lvi_mv_weight: float = 0.10
     lvi_two_view_weight: float = 0.05
@@ -2181,8 +2248,6 @@ def _auto_tune_for_mps_7b(
         new_window = cfg.window_size if cfg.window_size > 0 else target_window
         new_window = max(new_window, target_window)
         cfg.window_size = _update("window_size", cfg.window_size, new_window)
-    cfg.tiled_q = _update("tiled_q", cfg.tiled_q, max(cfg.tiled_q, 256))
-    cfg.tiled_k = _update("tiled_k", cfg.tiled_k, max(cfg.tiled_k, 384))
     if cfg.global_tokens <= 0:
         cfg.global_tokens = max(1, target_window // 512)
         adjustments.append(f"global_tokens:0->{cfg.global_tokens}")
@@ -2204,6 +2269,19 @@ def _auto_tune_for_mps_7b(
     )
     cfg.oom_retries = _update(
         "oom_retries", cfg.oom_retries, max(cfg.oom_retries, 5)
+    )
+    cfg.tiled_q = _update("tiled_q", cfg.tiled_q, max(cfg.tiled_q, 224))
+    cfg.tiled_k = _update("tiled_k", cfg.tiled_k, max(cfg.tiled_k, 384))
+    cfg.loss_guard = _update("loss_guard", cfg.loss_guard, max(cfg.loss_guard, 18.0))
+    cfg.ppl_cap = _update("ppl_cap", cfg.ppl_cap, max(cfg.ppl_cap, 12.0))
+    cfg.ppl_smooth_beta = _update(
+        "ppl_smooth_beta", cfg.ppl_smooth_beta, max(cfg.ppl_smooth_beta, 0.92)
+    )
+    cfg.tps_target = _update("tps_target", cfg.tps_target, max(cfg.tps_target, 200.0))
+    cfg.tps_boost_patience = _update(
+        "tps_boost_patience",
+        cfg.tps_boost_patience,
+        max(cfg.tps_boost_patience, 16),
     )
 
     env_updates: Dict[str, Any] = {}
@@ -2319,8 +2397,36 @@ class ThroughputMeter:
         return self.value
 
     def reset(self):
+        self.ready = False
+        self.value = 0.0
+
+
+class EMAMeter:
+    def __init__(self, beta: float = 0.95, clamp: Optional[Tuple[float, float]] = None):
+        self.beta = float(beta)
+        self.clamp = clamp
         self.value = 0.0
         self.ready = False
+
+    def update(self, val: float) -> float:
+        if not math.isfinite(val):
+            return self.value if self.ready else 0.0
+        if self.clamp is not None:
+            lo, hi = self.clamp
+            if lo is not None:
+                val = max(lo, val)
+            if hi is not None:
+                val = min(hi, val)
+        if not self.ready:
+            self.value = val
+            self.ready = True
+        else:
+            self.value = self.beta * self.value + (1.0 - self.beta) * val
+        return self.value
+
+    def reset(self):
+        self.ready = False
+        self.value = 0.0
 
 
 class ChronoScheduler:
@@ -2703,6 +2809,14 @@ class AetherTrainerBase:
         self._tps_meter = ThroughputMeter(beta=tps_beta)
         self._last_tok_per_sec = 0.0
         self._last_tok_per_sec_ema = 0.0
+        ppl_beta = float(getattr(self.cfg, "ppl_smooth_beta", 0.90))
+        self._ppl_cap = float(getattr(self.cfg, "ppl_cap", 0.0))
+        clamp_hi = self._ppl_cap if self._ppl_cap > 0 else None
+        self._loss_meter = EMAMeter(beta=ppl_beta, clamp=(0.0, clamp_hi))
+        self._loss_guard = float(getattr(self.cfg, "loss_guard", 0.0))
+        self._tps_target = float(getattr(self.cfg, "tps_target", 0.0))
+        self._tps_patience = max(1, int(getattr(self.cfg, "tps_boost_patience", 24)))
+        self._tps_underperf = 0
 
         wd = 0.01
 
@@ -2939,6 +3053,56 @@ class AetherTrainerBase:
         self._wait_stream(stream)
         return tensors
 
+    def _stabilize_loss_value(self, loss_avg: float) -> float:
+        guard = max(0.0, self._loss_guard)
+        if not math.isfinite(loss_avg):
+            print("[LOSS] non-finite mean detected; resetting scaler and clamping")
+            if self.scaler is not None:
+                try:
+                    self.scaler = GradScaler()
+                    print("[LOSS] GradScaler reset after NaN loss")
+                except Exception:
+                    pass
+            loss_avg = guard if guard > 0 else 0.0
+        if guard > 0 and loss_avg > guard:
+            print(
+                f"[LOSS] spike detected ({loss_avg:.4f}); clipped to guard {guard:.2f}"
+            )
+            if self.scaler is not None:
+                try:
+                    self.scaler = GradScaler()
+                    print("[LOSS] GradScaler reset after loss spike")
+                except Exception:
+                    pass
+            if hasattr(self, "_ai"):
+                try:
+                    self._ai.skip_next_step = True
+                except Exception:
+                    pass
+            loss_avg = guard
+        return loss_avg
+
+    def _maybe_boost_throughput(self, ema_tps: float):
+        target = max(0.0, self._tps_target)
+        if target <= 0:
+            return
+        if ema_tps >= target * 0.97:
+            self._tps_underperf = 0
+            return
+        self._tps_underperf += 1
+        if self._tps_underperf < self._tps_patience:
+            return
+        self._tps_underperf = 0
+        if not self._adaptive_micro:
+            return
+        if self._micro_active > self._micro_base:
+            new_micro = max(self._micro_base, self._micro_active // 2)
+            if new_micro < self._micro_active:
+                self._micro_active = new_micro
+                print(
+                    f"[THROUGHPUT] micro_batch tightened to {self._micro_active} (ema={ema_tps:.1f} < target={target:.1f})"
+                )
+
     def _rebuild_optimizer(self):
         wd = 0.01
         if getattr(self.cfg, "opt_cpu8bit", False):
@@ -3131,6 +3295,7 @@ class AetherTrainerMPS(AetherTrainerBase):
         total_steps = self.cfg.max_steps or int(self.cfg.epochs * steps_per_epoch)
         sched = ChronoScheduler(self.opt, self.cfg, total_steps=total_steps)
         self._tps_meter.reset()
+        self._loss_meter.reset()
         self._last_tok_per_sec = 0.0
         self._last_tok_per_sec_ema = 0.0
 
@@ -3462,12 +3627,19 @@ class AetherTrainerMPS(AetherTrainerBase):
                     except Exception:
                         pass
 
-                loss_avg = total_loss / max(1, total_tok)
-                ppl = math.exp(min(20.0, loss_avg))
+                raw_loss_avg = total_loss / max(1, total_tok)
+                loss_avg = self._stabilize_loss_value(raw_loss_avg)
+                loss_avg = max(0.0, loss_avg)
+                smooth_loss = self._loss_meter.update(loss_avg)
+                ppl_base = smooth_loss
+                if self._ppl_cap > 0:
+                    ppl_base = min(ppl_base, self._ppl_cap)
+                ppl = math.exp(ppl_base)
                 elapsed = time.time() - t0
                 t0 = time.time()
                 tps = float(total_tok) / max(1e-6, elapsed)
                 ema_tps = self._tps_meter.update(total_tok, elapsed)
+                self._maybe_boost_throughput(ema_tps)
                 self._last_tok_per_sec = float(tps)
                 self._last_tok_per_sec_ema = float(ema_tps)
                 lr_mult = sched.step()
@@ -3678,7 +3850,9 @@ class AetherTrainerMPS(AetherTrainerBase):
                     self.fabric.log(
                         {
                             "train/loss": float(loss_avg),
-                            "train/ce": float(loss_avg),
+                            "train/loss_raw": float(raw_loss_avg),
+                            "train/loss_smooth": float(smooth_loss),
+                            "train/ce": float(raw_loss_avg),
                             "train/ppl": float(ppl),
                             "train/tok_s": float(tps),
                             "train/tok_s_ema": float(ema_tps),
