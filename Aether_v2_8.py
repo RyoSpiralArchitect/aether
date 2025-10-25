@@ -415,6 +415,7 @@ _AETHER_DEFAULT_LORA_R = int(
 class FlashAttentionRuntime:
     def __init__(self):
         self._eps = 1e-6
+        self._fallbacks = 0
 
     def _block_sizes(self):
         bq = max(1, int(_aos.environ.get("AETHER_FLASH_BLOCK_Q", "128")))
@@ -474,14 +475,20 @@ class FlashAttentionRuntime:
         dropout_p: float = 0.0,
         is_causal: bool = True,
         training: bool = False,
+        scale_override: Optional[float] = None,
     ) -> torch.Tensor:
-        B, H, T, D = q.shape
+        B, H, Tq, D = q.shape
+        Tk = k.shape[2]
         block_q, block_k = self._block_sizes()
-        out = torch.zeros_like(q)
-        scale = 1.0 / math.sqrt(max(1, D))
+        out = torch.zeros((B, H, Tq, D), dtype=q.dtype, device=q.device)
+        scale = (
+            float(scale_override)
+            if scale_override is not None
+            else 1.0 / math.sqrt(max(1, D))
+        )
         eps = float(_aos.environ.get("AETHER_FLASH_EPS", self._eps))
-        for i0 in range(0, T, block_q):
-            i1 = min(i0 + block_q, T)
+        for i0 in range(0, Tq, block_q):
+            i1 = min(i0 + block_q, Tq)
             q_blk = q[:, :, i0:i1, :]
             q_pos = None
             if is_causal:
@@ -491,8 +498,8 @@ class FlashAttentionRuntime:
             )
             l_i = torch.zeros((B, H, i1 - i0), dtype=torch.float32, device=q.device)
             o_i = torch.zeros((B, H, i1 - i0, D), dtype=q.dtype, device=q.device)
-            for j0 in range(0, T, block_k):
-                j1 = min(j0 + block_k, T)
+            for j0 in range(0, Tk, block_k):
+                j1 = min(j0 + block_k, Tk)
                 scores = torch.einsum(
                     "bhqd,bhkd->bhqk", q_blk, k[:, :, j0:j1, :]
                 ).to(torch.float32)
@@ -1349,6 +1356,33 @@ def streaming_sdpa_mps(
 
 
 def _patched_sdpa(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
+    window = int(_PATCHED_SDPA["window"])
+    globals_n = int(_PATCHED_SDPA["global_tokens"])
+    stride = int(_PATCHED_SDPA["global_stride"])
+    prefer_flash = (
+        window <= 0
+        and globals_n <= 0
+        and stride <= 0
+        and _FLASH_ATTENTION.should_use(q)
+    )
+
+    if prefer_flash:
+        try:
+            return _FLASH_ATTENTION(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                dropout_p=float(dropout_p or 0.0),
+                is_causal=bool(is_causal),
+                training=bool(dropout_p and dropout_p > 0.0),
+                scale_override=scale,
+            )
+        except Exception as err:
+            if _FLASH_ATTENTION._fallbacks < 3:
+                print(f"[MPS][FLASH] fallback to streaming SDPA: {err}")
+            _FLASH_ATTENTION._fallbacks += 1
+
     return streaming_sdpa_mps(
         q,
         k,
@@ -1359,9 +1393,9 @@ def _patched_sdpa(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, scale
         _PATCHED_SDPA["tile_q"],
         _PATCHED_SDPA["tile_k"],
         _PATCHED_SDPA["fp32"],
-        _PATCHED_SDPA["window"],
-        _PATCHED_SDPA["global_tokens"],
-        _PATCHED_SDPA["global_stride"],
+        window,
+        globals_n,
+        stride,
     )
 
 
@@ -1418,7 +1452,8 @@ def _auto_enable_mps_flash_attention():
     if window > 0 or globals_n > 0 or stride > 0:
         set_sliding_window(window, globals_n, stride)
     print(
-        f"[MPS][FLASH] enabled streaming attention (tile_q={tile_q}, tile_k={tile_k}, window={window}, globals={globals_n}, stride={stride})"
+        "[MPS][FLASH] defaulted to custom kernel "
+        f"(tile_q={tile_q}, tile_k={tile_k}, window={window}, globals={globals_n}, stride={stride})"
     )
 
 
