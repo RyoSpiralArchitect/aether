@@ -1101,9 +1101,32 @@ class _AetherNumpyAIController:
             pass
 
 
-import spiral_chronostasis_v6_3 as chrono
-
-chrono.install_defaults()  # ~/.spiral/chronostasis.json を生成
+try:
+    import spiral_chronostasis_v6_3 as chrono  # type: ignore
+except Exception as _chrono_exc:
+    chrono = None
+    if os.environ.get("AETHER_SILENCE_OPTIONALS", "0") != "1":
+        print(
+            "[Chrono] spiral_chronostasis_v6_3 unavailable; skipping optional telemetry.",
+            file=sys.stderr,
+        )
+else:
+    try:
+        chrono.install_defaults()  # ~/.spiral/chronostasis.json を生成
+    except Exception as _chrono_exc_install:
+        print(
+            "[Chrono] install_defaults failed:",
+            _chrono_exc_install,
+            file=sys.stderr,
+        )
+    try:
+        print(chrono.stats())
+    except Exception as _chrono_exc_stats:
+        print(
+            "[Chrono] stats unavailable:",
+            _chrono_exc_stats,
+            file=sys.stderr,
+        )
 # === k-bridge (optional) ======================================================
 try:
     from kbridge.k_autograd import khuber_loss
@@ -1199,9 +1222,6 @@ def _build_classmap(vocab_size: int, scheme: str = "byte-basic", json_path: str 
 
 
 import string
-import spiral_chronostasis_v6_3 as chrono
-
-print(chrono.stats())
 # === ultramem (optional drop-in) ===
 try:
     import ultramem_patch as up
