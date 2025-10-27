@@ -376,17 +376,43 @@ def disable_tiled_sdpa():
         _AETHER_SDPA_ORIG = None
 
 import os
+import sys
 import time
 import math
 import json
 import glob
+import threading
 import random
 import types
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple, Dict, Any
-import numpy as np
 
-import torch
+try:
+    import numpy as _np
+    _AETHER_NUMPY_AVAILABLE = True
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    _np = None
+    _AETHER_NUMPY_AVAILABLE = False
+    print(
+        "[Aether] numpy is not available. Optional analytics and AI controllers are disabled.",
+        file=sys.stderr,
+    )
+
+
+def _require_numpy(feature: str = "this operation"):
+    if _np is None:
+        raise ModuleNotFoundError(
+            f"numpy is required for {feature}. Install it or disable the corresponding feature."
+        )
+    return _np
+
+try:
+    import torch
+except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
+    raise SystemExit(
+        "PyTorch is required to run Aether. Install it via `pip install torch`."
+    ) from exc
+
 from torch.amp import GradScaler
 
 
@@ -746,12 +772,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, IterableDataset
 
 # === ANI-AI (numpy micro-agent; optional, opt-in via env) =====================
-try:
-    import numpy as _np
-
-    _ANI_AI_AVAILABLE = True
-except Exception:
-    _ANI_AI_AVAILABLE = False
+_ANI_AI_AVAILABLE = _AETHER_NUMPY_AVAILABLE
 
 
 class _AetherNumpyAIController:
@@ -1081,9 +1102,58 @@ class _AetherNumpyAIController:
             pass
 
 
-import spiral_chronostasis_v6_3 as chrono
+_CHRONO_BOOTSTRAP_MODE = os.environ.get("AETHER_CHRONO_BOOTSTRAP", "async").lower()
+if os.environ.get("AETHER_DISABLE_CHRONO", "0") == "1":
+    chrono = None
+elif _CHRONO_BOOTSTRAP_MODE not in {"async", "sync", "off"}:
+    chrono = None
+    if os.environ.get("AETHER_SILENCE_OPTIONALS", "0") != "1":
+        print(
+            "[Chrono] Invalid AETHER_CHRONO_BOOTSTRAP mode; telemetry disabled.",
+            file=sys.stderr,
+        )
+else:
+    try:
+        import spiral_chronostasis_v6_3 as chrono  # type: ignore
+    except Exception as _chrono_exc:
+        chrono = None
+        if os.environ.get("AETHER_SILENCE_OPTIONALS", "0") != "1":
+            print(
+                "[Chrono] spiral_chronostasis_v6_3 unavailable; skipping optional telemetry.",
+                file=sys.stderr,
+            )
+    else:
+        _chrono_bootstrap_once = threading.Event()
 
-chrono.install_defaults()  # ~/.spiral/chronostasis.json を生成
+        def _chrono_bootstrap() -> None:
+            if _chrono_bootstrap_once.is_set():
+                return
+            _chrono_bootstrap_once.set()
+            try:
+                chrono.install_defaults()  # ~/.spiral/chronostasis.json を生成
+            except Exception as _chrono_exc_install:
+                print(
+                    "[Chrono] install_defaults failed:",
+                    _chrono_exc_install,
+                    file=sys.stderr,
+                )
+            try:
+                print(chrono.stats())
+            except Exception as _chrono_exc_stats:
+                print(
+                    "[Chrono] stats unavailable:",
+                    _chrono_exc_stats,
+                    file=sys.stderr,
+                )
+
+        if _CHRONO_BOOTSTRAP_MODE == "sync":
+            _chrono_bootstrap()
+        elif _CHRONO_BOOTSTRAP_MODE == "async":
+            threading.Thread(
+                target=_chrono_bootstrap,
+                name="aether-chrono-bootstrap",
+                daemon=True,
+            ).start()
 # === k-bridge (optional) ======================================================
 try:
     from kbridge.k_autograd import khuber_loss
@@ -1111,6 +1181,8 @@ def _build_classmap(vocab_size: int, scheme: str = "byte-basic", json_path: str 
       0=control(<32,127 except whitespace), 1=whitespace, 2=digit, 3=alpha,
       4=punct, 5=ascii-other, 6=non-ascii(>=128), 7=special(PAD/BOS/EOS/others)
     """
+    np_mod = _require_numpy("class grouping helpers")
+
     names = [
         "control",
         "whitespace",
@@ -1121,7 +1193,7 @@ def _build_classmap(vocab_size: int, scheme: str = "byte-basic", json_path: str 
         "nonASCII",
         "special",
     ]
-    m = _np.full((vocab_size,), 7, dtype=_np.int32)  # default= special/other
+    m = np_mod.full((vocab_size,), 7, dtype=np_mod.int32)  # default= special/other
     # specials
     for t in [0, 1, 2]:
         if t < vocab_size:
@@ -1141,7 +1213,7 @@ def _build_classmap(vocab_size: int, scheme: str = "byte-basic", json_path: str 
                         if 0 <= k < vocab_size:
                             m[k] = g
                 elif isinstance(obj, list):
-                    arr = _np.asarray(obj, dtype=_np.int32).ravel()
+                    arr = np_mod.asarray(obj, dtype=np_mod.int32).ravel()
                     m[: min(vocab_size, arr.size)] = arr[: min(vocab_size, arr.size)]
                 return m, names
         except Exception:
@@ -1166,20 +1238,17 @@ def _build_classmap(vocab_size: int, scheme: str = "byte-basic", json_path: str 
             m[tid] = 6  # non-ASCII
     if scheme == "byte-compact":
         # merge some buckets: asciiOther->punct, control->whitespace
-        m[_np.where(m == 5)] = 4
-        m[_np.where(m == 0)] = 1
+        m[np_mod.where(m == 5)] = 4
+        m[np_mod.where(m == 0)] = 1
         names = ["ws", "digit", "alpha", "punct", "nonASCII", "special"]  # compact view
         # remap indices to 0..5
         # mapping: ws(1)->0, digit(2)->1, alpha(3)->2, punct(4 or 5)->3, nonASCII(6)->4, special(7)->5
-        remap = _np.array([3, 0, 1, 2, 3, 3, 4, 5], dtype=_np.int32)
+        remap = np_mod.array([3, 0, 1, 2, 3, 3, 4, 5], dtype=np_mod.int32)
         m = remap[m]
     return m, names
 
 
 import string
-import spiral_chronostasis_v6_3 as chrono
-
-print(chrono.stats())
 # === ultramem (optional drop-in) ===
 try:
     import ultramem_patch as up
@@ -1265,7 +1334,8 @@ def disable_gradient_checkpointing(model):
 # --- misc utils --------------------------------------------------------------
 def set_seed(seed: int = 1337):
     random.seed(seed)
-    np.random.seed(seed)
+    if _np is not None:
+        _np.random.seed(seed)
     torch.manual_seed(seed)
 
 
@@ -2173,6 +2243,8 @@ class TrainConfig:
     auto_mps_7b: bool = False
     auto_mps_param_threshold: int = 5_000_000_000
     auto_mps_target_seq: int = 4096
+    auto_mps_token_budget: int = 8192
+    auto_mps_min_micro_batch: int = 1
     mps_7b_lora_rank: Optional[int] = None
     mps_7b_lora_alpha: Optional[int] = None
     mps_7b_lora_dropout: float = 0.05
@@ -2211,15 +2283,59 @@ def _auto_tune_for_mps_7b(
             report[name] = {"old": current, "new": new_val}
         return new_val
 
-    cfg.batch_size = _update("batch_size", cfg.batch_size, max(1, min(cfg.batch_size, 2)))
-    cfg.micro_batch = _update(
-        "micro_batch", cfg.micro_batch, max(1, min(cfg.micro_batch, cfg.batch_size))
+    cfg_max_len = int(getattr(cfg, "max_len", 4096))
+    target_seq = int(getattr(cfg, "auto_mps_target_seq", cfg_max_len))
+    target_seq = max(512, min(cfg_max_len, target_seq))
+    token_budget = int(
+        getattr(cfg, "auto_mps_token_budget", target_seq * max(1, int(cfg.batch_size)))
     )
+    token_budget = max(target_seq, token_budget)
+    min_micro = max(1, int(getattr(cfg, "auto_mps_min_micro_batch", 1)))
+    report["token_budget"] = {
+        "target": token_budget,
+        "sequence": target_seq,
+        "min_micro": min_micro,
+    }
+
+    cfg.max_len = _update("max_len", cfg.max_len, min(cfg_max_len, target_seq))
+
+    ideal_batch = max(1, math.ceil(token_budget / target_seq))
+    cfg.batch_size = _update(
+        "batch_size", cfg.batch_size, max(1, min(cfg.batch_size, ideal_batch))
+    )
+
+    desired_micro = max(min_micro, min(cfg.micro_batch, cfg.batch_size))
+    if cfg.batch_size <= 2:
+        desired_micro = max(1, int(cfg.batch_size))
+    cfg.micro_batch = _update("micro_batch", cfg.micro_batch, max(1, int(desired_micro)))
+
+    micro = max(1, int(cfg.micro_batch))
+    chunk_size = max(1, math.ceil(max(1, int(cfg.batch_size)) / micro))
+    effective_tokens = max(1, int(cfg.batch_size)) * target_seq
+    chunk_tokens = chunk_size * target_seq
+    report["token_budget"].update(
+        {
+            "effective": effective_tokens,
+            "chunk_size": chunk_size,
+            "chunk_tokens": chunk_tokens,
+            "micro": micro,
+            "max_len": int(cfg.max_len),
+        }
+    )
+
+    new_micro_cap = max(cfg.adaptive_micro_max, micro * 4, max(1, int(cfg.batch_size)) * 4)
     cfg.adaptive_micro_max = _update(
-        "adaptive_micro_max",
-        cfg.adaptive_micro_max,
-        max(cfg.adaptive_micro_max, cfg.micro_batch * 4),
+        "adaptive_micro_max", cfg.adaptive_micro_max, new_micro_cap
     )
+    new_recover = max(cfg.adaptive_micro_recover, max(256, micro * 32), 512)
+    cfg.adaptive_micro_recover = _update(
+        "adaptive_micro_recover",
+        cfg.adaptive_micro_recover,
+        new_recover,
+    )
+    if float(getattr(cfg, "tps_target", 0.0)) <= 0.0:
+        cfg.tps_target = _update("tps_target", cfg.tps_target, float(chunk_tokens))
+    report["token_budget"]["tps_target"] = float(getattr(cfg, "tps_target", 0.0))
     cfg.loader_num_workers = _update(
         "loader_num_workers", cfg.loader_num_workers, max(cfg.loader_num_workers, 2)
     )
@@ -2256,7 +2372,7 @@ def _auto_tune_for_mps_7b(
         cfg.matmul_precision = "high"
         adjustments.append("matmul_precision:None->high")
         report["matmul_precision"] = {"old": None, "new": "high"}
-    target_window = int(getattr(cfg, "auto_mps_target_seq", 4096))
+    target_window = int(target_seq)
     if target_window > 0:
         new_window = cfg.window_size if cfg.window_size > 0 else target_window
         new_window = max(new_window, target_window)
@@ -2274,11 +2390,6 @@ def _auto_tune_for_mps_7b(
     )
     cfg.empty_cache_every = _update(
         "empty_cache_every", cfg.empty_cache_every, max(cfg.empty_cache_every, 128)
-    )
-    cfg.adaptive_micro_recover = _update(
-        "adaptive_micro_recover",
-        cfg.adaptive_micro_recover,
-        max(cfg.adaptive_micro_recover, 512),
     )
     cfg.oom_retries = _update(
         "oom_retries", cfg.oom_retries, max(cfg.oom_retries, 5)
@@ -2362,8 +2473,23 @@ def _auto_tune_for_mps_7b(
         report["env"] = env_updates
 
     summary = ", ".join(adjustments) if adjustments else "defaults"
+    token_note = ""
+    tb = report.get("token_budget")
+    if isinstance(tb, dict):
+        eff = tb.get("effective")
+        tgt = tb.get("target")
+        chunk_tokens = tb.get("chunk_tokens")
+        chunk_size = tb.get("chunk_size")
+        seq_len = tb.get("sequence")
+        micro = tb.get("micro")
+        if eff and tgt:
+            token_note = f"; tokens={int(eff):,}/{int(tgt):,}"
+            if chunk_tokens and chunk_size and seq_len and micro is not None:
+                token_note += (
+                    f" (chunk={int(chunk_size)}×{int(seq_len)}, micro={int(micro)})"
+                )
     print(
-        f"[MPS][7B] auto-tune applied (params≈{total_params/1e9:.2f}B): {summary}"
+        f"[MPS][7B] auto-tune applied (params≈{total_params/1e9:.2f}B): {summary}{token_note}"
     )
     return report
 
@@ -2790,6 +2916,37 @@ class AetherTrainerBase:
         self.device = detect_device()
 
         self._mps7b_report = _auto_tune_for_mps_7b(self.model, self.cfg, self.device)
+        self._token_budget = 0
+        self._token_chunk = 0
+        self._token_budget_target = 0
+        self._token_sequence = 0
+        token_report = (
+            self._mps7b_report.get("token_budget")
+            if isinstance(self._mps7b_report, dict)
+            else None
+        )
+        if isinstance(token_report, dict):
+            self._token_budget = int(token_report.get("effective", 0) or 0)
+            self._token_chunk = int(token_report.get("chunk_tokens", 0) or 0)
+            self._token_budget_target = int(token_report.get("target", 0) or 0)
+            self._token_sequence = int(token_report.get("sequence", 0) or 0)
+            if self._token_budget > 0:
+                seq = token_report.get("sequence")
+                chunk = token_report.get("chunk_size")
+                micro = token_report.get("micro")
+                msg = (
+                    f"[MPS][7B] token budget≈{self._token_budget:,}/{max(self._token_budget_target, 1):,}"
+                )
+                detail = []
+                if self._token_chunk > 0:
+                    detail.append(f"chunk≈{self._token_chunk:,}")
+                if chunk and seq:
+                    detail.append(f"layout={int(chunk)}×{int(seq)}")
+                if micro:
+                    detail.append(f"micro={int(micro)}")
+                if detail:
+                    msg += " (" + ", ".join(detail) + ")"
+                print(msg)
 
         matmul_mode = getattr(self.cfg, "matmul_precision", None)
         if matmul_mode:
@@ -2981,9 +3138,19 @@ class AetherTrainerBase:
                 f"[ADAPT] micro_batch base={self._micro_base}, cap={self._micro_cap}"
             )
         # --- k-bridge integration knobs (safe opt-in; default on if installed) ---
-        self._k_enabled = bool(
+        requested_k = bool(
             int(os.environ.get("KBRIDGE_ENABLE", "1" if _KBRIDGE_AVAILABLE else "0"))
         )
+        self._k_enabled = (
+            requested_k and _KBRIDGE_AVAILABLE and _AETHER_NUMPY_AVAILABLE
+        )
+        if requested_k and not self._k_enabled:
+            reason = (
+                "numpy unavailable"
+                if not _AETHER_NUMPY_AVAILABLE
+                else "kbridge package not available"
+            )
+            print(f"[KBRIDGE] disabled ({reason})")
         self._k_reg_w = float(os.environ.get("KBRIDGE_REG_W", "0.0"))
         self._kb_buf_cap = int(os.environ.get("KBRIDGE_BUF_CAP", "200000"))
         self._kb_ece_bins = int(os.environ.get("KBRIDGE_ECE_BINS", "15"))
@@ -3003,42 +3170,60 @@ class AetherTrainerBase:
             for x in os.environ.get("KBRIDGE_ECE_C_LIST", "").split(",")
             if x.strip().isdigit()
         ]
-        _len_edges_env = os.environ.get("KBRIDGE_LEN_BUCKETS", "0,128,512,2048,1000000")
-        try:
-            _edges = [int(x) for x in _len_edges_env.split(",") if x.strip()]
-            _edges = sorted(set([x for x in _edges if x >= 0]))
-            if len(_edges) < 2:
-                _edges = [0, 1_000_000]
-            self._kb_len_edges = _np.asarray(_edges, dtype=_np.int64)
-        except Exception:
-            self._kb_len_edges = _np.asarray([0, 1_000_000], dtype=_np.int64)
-        # token-level buffers
-        self._kb_buf_pmax = []
-        self._kb_buf_labels = []
-        self._kb_buf_predcls = []
-        self._kb_buf_truecls = []
-        self._kb_buf_lenbin = []
-        # sequence-level NDCG buffer
-        self._kb_seq_scores = []
-        self._kb_seq_gains = []
-        # class groups (built from vocab & scheme or custom json)
-        self._kb_class_scheme = (
-            os.environ.get("KBRIDGE_CLASSMAP", "byte-basic").strip().lower()
-        )
-        self._kb_class_json = os.environ.get("KBRIDGE_CLASSMAP_FILE", "").strip()
-        try:
-            self._kb_classmap, self._kb_group_names = _build_classmap(
-                vocab_size=getattr(self.model, "vocab_size", 32000),
-                scheme=self._kb_class_scheme,
-                json_path=self._kb_class_json,
+        if self._k_enabled:
+            np_mod = _require_numpy("knowledge-bridge configuration")
+            _len_edges_env = os.environ.get(
+                "KBRIDGE_LEN_BUCKETS", "0,128,512,2048,1000000"
             )
-            self._kb_group_count = int(self._kb_classmap.max()) + 1
-        except Exception:
-            self._kb_classmap = _np.zeros(
-                (getattr(self.model, "vocab_size", 32000),), dtype=_np.int32
+            try:
+                _edges = [int(x) for x in _len_edges_env.split(",") if x.strip()]
+                _edges = sorted(set([x for x in _edges if x >= 0]))
+                if len(_edges) < 2:
+                    _edges = [0, 1_000_000]
+                self._kb_len_edges = np_mod.asarray(_edges, dtype=np_mod.int64)
+            except Exception:
+                self._kb_len_edges = np_mod.asarray([0, 1_000_000], dtype=np_mod.int64)
+            # token-level buffers
+            self._kb_buf_pmax = []
+            self._kb_buf_labels = []
+            self._kb_buf_predcls = []
+            self._kb_buf_truecls = []
+            self._kb_buf_lenbin = []
+            # sequence-level NDCG buffer
+            self._kb_seq_scores = []
+            self._kb_seq_gains = []
+            # class groups (built from vocab & scheme or custom json)
+            self._kb_class_scheme = (
+                os.environ.get("KBRIDGE_CLASSMAP", "byte-basic").strip().lower()
             )
+            self._kb_class_json = os.environ.get("KBRIDGE_CLASSMAP_FILE", "").strip()
+            try:
+                self._kb_classmap, self._kb_group_names = _build_classmap(
+                    vocab_size=getattr(self.model, "vocab_size", 32000),
+                    scheme=self._kb_class_scheme,
+                    json_path=self._kb_class_json,
+                )
+                self._kb_group_count = int(self._kb_classmap.max()) + 1
+            except Exception:
+                self._kb_classmap = np_mod.zeros(
+                    (getattr(self.model, "vocab_size", 32000),), dtype=np_mod.int32
+                )
+                self._kb_group_names = []
+                self._kb_group_count = int(self._kb_classmap.max()) + 1
+        else:
+            self._kb_len_edges = None
+            self._kb_buf_pmax = []
+            self._kb_buf_labels = []
+            self._kb_buf_predcls = []
+            self._kb_buf_truecls = []
+            self._kb_buf_lenbin = []
+            self._kb_seq_scores = []
+            self._kb_seq_gains = []
+            self._kb_class_scheme = os.environ.get("KBRIDGE_CLASSMAP", "byte-basic").strip().lower()
+            self._kb_class_json = os.environ.get("KBRIDGE_CLASSMAP_FILE", "").strip()
+            self._kb_classmap = None
             self._kb_group_names = []
-            self._kb_group_count = int(self._kb_classmap.max()) + 1
+            self._kb_group_count = 0
         # 2D ECE（len×class）や T sweep/quantile bins
         self._kb_enable_2d = bool(int(os.environ.get("KBRIDGE_ECE_2D", "0")))
         self._kb_2d_max_cells = int(os.environ.get("KBRIDGE_2D_MAX_CELLS", "24"))
@@ -3280,10 +3465,10 @@ class AetherTrainerBase:
     # External hook to feed sequence-level eval (scores/gains per sequence)
     def kb_push_seq_eval(self, scores_row, gains_row):
         try:
-            import numpy as _np
+            np_mod = _require_numpy("sequence evaluation cache")
 
-            s = _np.asarray(scores_row, dtype=_np.float64).ravel()
-            g = _np.asarray(gains_row, dtype=_np.float64).ravel()
+            s = np_mod.asarray(scores_row, dtype=np_mod.float64).ravel()
+            g = np_mod.asarray(gains_row, dtype=np_mod.float64).ravel()
             if s.shape == g.shape and s.size > 0:
                 self._kb_seq_scores.append(s)
                 self._kb_seq_gains.append(g)
@@ -3743,6 +3928,17 @@ class AetherTrainerMPS(AetherTrainerBase):
                 step += 1
                 self._global_step = step
 
+                budget_ratio = (
+                    float(total_tok) / float(self._token_budget)
+                    if self._token_budget > 0
+                    else 0.0
+                )
+                chunk_hint = (
+                    float(self._token_chunk)
+                    if self._token_chunk > 0
+                    else float(total_tok)
+                )
+
                 if self._adaptive_micro:
                     if self._micro_active > self._micro_base:
                         self._micro_stable += 1
@@ -3807,7 +4003,9 @@ class AetherTrainerMPS(AetherTrainerBase):
                                 .astype("int32", copy=False)
                             )
                             # length-bin per token
-                            import numpy as _np
+                            np_mod = _require_numpy(
+                                "knowledge-bridge token analytics"
+                            )
 
                             lens = mask.sum(dim=1).detach().cpu().tolist()
                             edges = self._kb_len_edges
@@ -3822,19 +4020,19 @@ class AetherTrainerMPS(AetherTrainerBase):
                                         b = j
                                         break
                                 lenbins.append(
-                                    _np.full(
-                                        (int(mask[i].sum().item()),), b, dtype=_np.int32
+                                    np_mod.full(
+                                        (int(mask[i].sum().item()),), b, dtype=np_mod.int32
                                     )
                                 )
                             lbins = (
-                                _np.concatenate(lenbins, axis=0)
+                                np_mod.concatenate(lenbins, axis=0)
                                 if len(lenbins) > 0
-                                else _np.zeros((0,), dtype=_np.int32)
+                                else np_mod.zeros((0,), dtype=np_mod.int32)
                             )
                             # groups (map token id -> group id)
                             cm = self._kb_classmap
-                            prg = cm[_np.clip(pr, 0, cm.size - 1)]
-                            trg = cm[_np.clip(tr, 0, cm.size - 1)]
+                            prg = cm[np_mod.clip(pr, 0, cm.size - 1)]
+                            trg = cm[np_mod.clip(tr, 0, cm.size - 1)]
                             # append
                             self._kb_buf_pmax.append(pm)
                             self._kb_buf_labels.append(lb)
@@ -3954,6 +4152,13 @@ class AetherTrainerMPS(AetherTrainerBase):
                             "train/tok_s": float(tps),
                             "train/tok_s_ema": float(ema_tps),
                             "train/lr_mult": float(lr_mult),
+                            "train/token_budget_ratio": float(budget_ratio),
+                            "train/token_chunk_hint": float(chunk_hint),
+                            "train/token_budget_target": float(
+                                self._token_budget_target
+                                if self._token_budget_target > 0
+                                else 0.0
+                            ),
                         },
                         step=step,
                     )
@@ -3966,38 +4171,38 @@ class AetherTrainerMPS(AetherTrainerBase):
                         and self._kb_buf_pmax
                     ):
                         try:
-                            import numpy as _np
+                            np_mod = _require_numpy("knowledge-bridge aggregate metrics")
 
-                            pm = _np.concatenate(self._kb_buf_pmax, axis=0)
-                            lb = _np.concatenate(self._kb_buf_labels, axis=0)
+                            pm = np_mod.concatenate(self._kb_buf_pmax, axis=0)
+                            lb = np_mod.concatenate(self._kb_buf_labels, axis=0)
                             pr = (
-                                _np.concatenate(self._kb_buf_predcls, axis=0)
+                                np_mod.concatenate(self._kb_buf_predcls, axis=0)
                                 if getattr(self, "_kb_buf_predcls", None)
-                                else _np.zeros((0,), dtype=_np.int32)
+                                else np_mod.zeros((0,), dtype=np_mod.int32)
                             )
                             tr = (
-                                _np.concatenate(self._kb_buf_truecls, axis=0)
+                                np_mod.concatenate(self._kb_buf_truecls, axis=0)
                                 if getattr(self, "_kb_buf_truecls", None)
-                                else _np.zeros((0,), dtype=_np.int32)
+                                else np_mod.zeros((0,), dtype=np_mod.int32)
                             )
                             ln = (
-                                _np.concatenate(self._kb_buf_lenbin, axis=0)
+                                np_mod.concatenate(self._kb_buf_lenbin, axis=0)
                                 if self._kb_buf_lenbin
-                                else _np.zeros((0,), dtype=_np.int32)
+                                else np_mod.zeros((0,), dtype=np_mod.int32)
                             )
                             prg = (
-                                _np.concatenate(
+                                np_mod.concatenate(
                                     getattr(self, "_kb_buf_predgrp", []), axis=0
                                 )
                                 if getattr(self, "_kb_buf_predgrp", None)
-                                else _np.zeros((0,), dtype=_np.int32)
+                                else np_mod.zeros((0,), dtype=np_mod.int32)
                             )
                             trg = (
-                                _np.concatenate(
+                                np_mod.concatenate(
                                     getattr(self, "_kb_buf_truegrp", []), axis=0
                                 )
                                 if getattr(self, "_kb_buf_truegrp", None)
-                                else _np.zeros((0,), dtype=_np.int32)
+                                else np_mod.zeros((0,), dtype=np_mod.int32)
                             )
                             # overall ECE + hist（等幅）
                             ece, counts, mconf, macc = ece_and_hist_k(
@@ -4016,16 +4221,16 @@ class AetherTrainerMPS(AetherTrainerBase):
                                         Q = max(2, int(qspec[1:]))
                                     except Exception:
                                         Q = 10
-                                    qs = _np.linspace(0.0, 1.0, Q + 1)
-                                    edges = _np.quantile(pm, qs)
+                                    qs = np_mod.linspace(0.0, 1.0, Q + 1)
+                                    edges = np_mod.quantile(pm, qs)
                                 else:
-                                    edges = _np.asarray(
+                                    edges = np_mod.asarray(
                                         [
                                             float(x)
                                             for x in qspec.split(",")
                                             if x.strip()
                                         ],
-                                        dtype=_np.float64,
+                                        dtype=np_mod.float64,
                                     )
                                 edges[0] = 0.0
                                 edges[-1] = 1.0
@@ -4052,7 +4257,7 @@ class AetherTrainerMPS(AetherTrainerBase):
                                         i for i in self._kb_ece_c_list if 0 <= i < G
                                     ]
                                 else:
-                                    order = _np.argsort(-c_g)
+                                    order = np_mod.argsort(-c_g)
                                     idxs = [
                                         int(i)
                                         for i in order[: max(1, self._kb_ece_c_top)]
@@ -4091,7 +4296,7 @@ class AetherTrainerMPS(AetherTrainerBase):
                                         i for i in self._kb_ece_c_list if 0 <= i < G
                                     ]
                                 else:
-                                    order = _np.argsort(-c_all)
+                                    order = np_mod.argsort(-c_all)
                                     sel_groups = [
                                         int(i)
                                         for i in order[: max(1, self._kb_ece_c_top)]
@@ -4141,20 +4346,20 @@ class AetherTrainerMPS(AetherTrainerBase):
                     # --- K-bridge: sequence-level NDCG@k (external hook provided)
                     if self._k_enabled and _KBRIDGE_AVAILABLE and self._kb_seq_scores:
                         try:
-                            import numpy as _np
+                            np_mod = _require_numpy("sequence-level NDCG evaluation")
 
                             kseq = int(os.environ.get("KBRIDGE_NDCG_K", "10"))
                             Lmax = max(s.size for s in self._kb_seq_scores)
-                            S = _np.stack(
+                            S = np_mod.stack(
                                 [
-                                    _np.pad(s, (0, Lmax - s.size), constant_values=0.0)
+                                    np_mod.pad(s, (0, Lmax - s.size), constant_values=0.0)
                                     for s in self._kb_seq_scores
                                 ],
                                 axis=0,
                             )
-                            R = _np.stack(
+                            R = np_mod.stack(
                                 [
-                                    _np.pad(g, (0, Lmax - g.size), constant_values=0.0)
+                                    np_mod.pad(g, (0, Lmax - g.size), constant_values=0.0)
                                     for g in self._kb_seq_gains
                                 ],
                                 axis=0,
@@ -4279,6 +4484,12 @@ def __aether_main__():
             raise SystemExit("MPS is required. Run on macOS with Apple Silicon.")
 
     _require_mps()
+
+    def _count_glob(pattern: str) -> int:
+        if not pattern:
+            return 0
+        return sum(1 for _ in glob.iglob(pattern, recursive=True))
+
     import argparse
 
     ap = argparse.ArgumentParser()
@@ -4361,6 +4572,8 @@ def __aether_main__():
     ap.add_argument("--lora_dropout", type=float, default=0.05)
     ap.add_argument("--auto_mps_7b", action="store_true")
     ap.add_argument("--auto_mps_target_seq", type=int, default=4096)
+    ap.add_argument("--auto_mps_token_budget", type=int, default=8192)
+    ap.add_argument("--auto_mps_min_micro_batch", type=int, default=1)
     ap.add_argument("--mps_7b_lora_rank", type=int, default=-1)
     ap.add_argument("--mps_7b_lora_alpha", type=int, default=0)
     ap.add_argument("--mps_7b_lora_dropout", type=float, default=0.05)
@@ -4499,6 +4712,8 @@ def __aether_main__():
         disallow_mps_fallback=not bool(args.allow_mps_cpu_fallback),
         auto_mps_7b=bool(args.auto_mps_7b),
         auto_mps_target_seq=int(args.auto_mps_target_seq),
+        auto_mps_token_budget=max(1, int(args.auto_mps_token_budget)),
+        auto_mps_min_micro_batch=max(1, int(args.auto_mps_min_micro_batch)),
         mps_7b_lora_rank=(
             int(args.mps_7b_lora_rank) if int(args.mps_7b_lora_rank) > 0 else None
         ),
@@ -4557,8 +4772,8 @@ def __aether_main__():
 
     # Train
     # --- Preflight: how many files will be used (見える化)
-    n_tr = len(glob.glob(args.train_glob, recursive=True)) if args.train_glob else 0
-    n_va = len(glob.glob(args.val_glob, recursive=True)) if args.val_glob else 0
+    n_tr = _count_glob(args.train_glob)
+    n_va = _count_glob(args.val_glob)
     print(
         f"[DATA] train files={n_tr}  val files={n_va}  pattern_train={args.train_glob}  cwd={os.getcwd()}"
     )
