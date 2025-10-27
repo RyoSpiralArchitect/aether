@@ -381,6 +381,7 @@ import time
 import math
 import json
 import glob
+import threading
 import random
 import types
 from dataclasses import dataclass, field
@@ -1101,32 +1102,58 @@ class _AetherNumpyAIController:
             pass
 
 
-try:
-    import spiral_chronostasis_v6_3 as chrono  # type: ignore
-except Exception as _chrono_exc:
+_CHRONO_BOOTSTRAP_MODE = os.environ.get("AETHER_CHRONO_BOOTSTRAP", "async").lower()
+if os.environ.get("AETHER_DISABLE_CHRONO", "0") == "1":
+    chrono = None
+elif _CHRONO_BOOTSTRAP_MODE not in {"async", "sync", "off"}:
     chrono = None
     if os.environ.get("AETHER_SILENCE_OPTIONALS", "0") != "1":
         print(
-            "[Chrono] spiral_chronostasis_v6_3 unavailable; skipping optional telemetry.",
+            "[Chrono] Invalid AETHER_CHRONO_BOOTSTRAP mode; telemetry disabled.",
             file=sys.stderr,
         )
 else:
     try:
-        chrono.install_defaults()  # ~/.spiral/chronostasis.json を生成
-    except Exception as _chrono_exc_install:
-        print(
-            "[Chrono] install_defaults failed:",
-            _chrono_exc_install,
-            file=sys.stderr,
-        )
-    try:
-        print(chrono.stats())
-    except Exception as _chrono_exc_stats:
-        print(
-            "[Chrono] stats unavailable:",
-            _chrono_exc_stats,
-            file=sys.stderr,
-        )
+        import spiral_chronostasis_v6_3 as chrono  # type: ignore
+    except Exception as _chrono_exc:
+        chrono = None
+        if os.environ.get("AETHER_SILENCE_OPTIONALS", "0") != "1":
+            print(
+                "[Chrono] spiral_chronostasis_v6_3 unavailable; skipping optional telemetry.",
+                file=sys.stderr,
+            )
+    else:
+        _chrono_bootstrap_once = threading.Event()
+
+        def _chrono_bootstrap() -> None:
+            if _chrono_bootstrap_once.is_set():
+                return
+            _chrono_bootstrap_once.set()
+            try:
+                chrono.install_defaults()  # ~/.spiral/chronostasis.json を生成
+            except Exception as _chrono_exc_install:
+                print(
+                    "[Chrono] install_defaults failed:",
+                    _chrono_exc_install,
+                    file=sys.stderr,
+                )
+            try:
+                print(chrono.stats())
+            except Exception as _chrono_exc_stats:
+                print(
+                    "[Chrono] stats unavailable:",
+                    _chrono_exc_stats,
+                    file=sys.stderr,
+                )
+
+        if _CHRONO_BOOTSTRAP_MODE == "sync":
+            _chrono_bootstrap()
+        elif _CHRONO_BOOTSTRAP_MODE == "async":
+            threading.Thread(
+                target=_chrono_bootstrap,
+                name="aether-chrono-bootstrap",
+                daemon=True,
+            ).start()
 # === k-bridge (optional) ======================================================
 try:
     from kbridge.k_autograd import khuber_loss
@@ -2216,6 +2243,8 @@ class TrainConfig:
     auto_mps_7b: bool = False
     auto_mps_param_threshold: int = 5_000_000_000
     auto_mps_target_seq: int = 4096
+    auto_mps_token_budget: int = 8192
+    auto_mps_min_micro_batch: int = 1
     mps_7b_lora_rank: Optional[int] = None
     mps_7b_lora_alpha: Optional[int] = None
     mps_7b_lora_dropout: float = 0.05
@@ -2254,15 +2283,59 @@ def _auto_tune_for_mps_7b(
             report[name] = {"old": current, "new": new_val}
         return new_val
 
-    cfg.batch_size = _update("batch_size", cfg.batch_size, max(1, min(cfg.batch_size, 2)))
-    cfg.micro_batch = _update(
-        "micro_batch", cfg.micro_batch, max(1, min(cfg.micro_batch, cfg.batch_size))
+    cfg_max_len = int(getattr(cfg, "max_len", 4096))
+    target_seq = int(getattr(cfg, "auto_mps_target_seq", cfg_max_len))
+    target_seq = max(512, min(cfg_max_len, target_seq))
+    token_budget = int(
+        getattr(cfg, "auto_mps_token_budget", target_seq * max(1, int(cfg.batch_size)))
     )
+    token_budget = max(target_seq, token_budget)
+    min_micro = max(1, int(getattr(cfg, "auto_mps_min_micro_batch", 1)))
+    report["token_budget"] = {
+        "target": token_budget,
+        "sequence": target_seq,
+        "min_micro": min_micro,
+    }
+
+    cfg.max_len = _update("max_len", cfg.max_len, min(cfg_max_len, target_seq))
+
+    ideal_batch = max(1, math.ceil(token_budget / target_seq))
+    cfg.batch_size = _update(
+        "batch_size", cfg.batch_size, max(1, min(cfg.batch_size, ideal_batch))
+    )
+
+    desired_micro = max(min_micro, min(cfg.micro_batch, cfg.batch_size))
+    if cfg.batch_size <= 2:
+        desired_micro = max(1, int(cfg.batch_size))
+    cfg.micro_batch = _update("micro_batch", cfg.micro_batch, max(1, int(desired_micro)))
+
+    micro = max(1, int(cfg.micro_batch))
+    chunk_size = max(1, math.ceil(max(1, int(cfg.batch_size)) / micro))
+    effective_tokens = max(1, int(cfg.batch_size)) * target_seq
+    chunk_tokens = chunk_size * target_seq
+    report["token_budget"].update(
+        {
+            "effective": effective_tokens,
+            "chunk_size": chunk_size,
+            "chunk_tokens": chunk_tokens,
+            "micro": micro,
+            "max_len": int(cfg.max_len),
+        }
+    )
+
+    new_micro_cap = max(cfg.adaptive_micro_max, micro * 4, max(1, int(cfg.batch_size)) * 4)
     cfg.adaptive_micro_max = _update(
-        "adaptive_micro_max",
-        cfg.adaptive_micro_max,
-        max(cfg.adaptive_micro_max, cfg.micro_batch * 4),
+        "adaptive_micro_max", cfg.adaptive_micro_max, new_micro_cap
     )
+    new_recover = max(cfg.adaptive_micro_recover, max(256, micro * 32), 512)
+    cfg.adaptive_micro_recover = _update(
+        "adaptive_micro_recover",
+        cfg.adaptive_micro_recover,
+        new_recover,
+    )
+    if float(getattr(cfg, "tps_target", 0.0)) <= 0.0:
+        cfg.tps_target = _update("tps_target", cfg.tps_target, float(chunk_tokens))
+    report["token_budget"]["tps_target"] = float(getattr(cfg, "tps_target", 0.0))
     cfg.loader_num_workers = _update(
         "loader_num_workers", cfg.loader_num_workers, max(cfg.loader_num_workers, 2)
     )
@@ -2299,7 +2372,7 @@ def _auto_tune_for_mps_7b(
         cfg.matmul_precision = "high"
         adjustments.append("matmul_precision:None->high")
         report["matmul_precision"] = {"old": None, "new": "high"}
-    target_window = int(getattr(cfg, "auto_mps_target_seq", 4096))
+    target_window = int(target_seq)
     if target_window > 0:
         new_window = cfg.window_size if cfg.window_size > 0 else target_window
         new_window = max(new_window, target_window)
@@ -2317,11 +2390,6 @@ def _auto_tune_for_mps_7b(
     )
     cfg.empty_cache_every = _update(
         "empty_cache_every", cfg.empty_cache_every, max(cfg.empty_cache_every, 128)
-    )
-    cfg.adaptive_micro_recover = _update(
-        "adaptive_micro_recover",
-        cfg.adaptive_micro_recover,
-        max(cfg.adaptive_micro_recover, 512),
     )
     cfg.oom_retries = _update(
         "oom_retries", cfg.oom_retries, max(cfg.oom_retries, 5)
@@ -2405,8 +2473,23 @@ def _auto_tune_for_mps_7b(
         report["env"] = env_updates
 
     summary = ", ".join(adjustments) if adjustments else "defaults"
+    token_note = ""
+    tb = report.get("token_budget")
+    if isinstance(tb, dict):
+        eff = tb.get("effective")
+        tgt = tb.get("target")
+        chunk_tokens = tb.get("chunk_tokens")
+        chunk_size = tb.get("chunk_size")
+        seq_len = tb.get("sequence")
+        micro = tb.get("micro")
+        if eff and tgt:
+            token_note = f"; tokens={int(eff):,}/{int(tgt):,}"
+            if chunk_tokens and chunk_size and seq_len and micro is not None:
+                token_note += (
+                    f" (chunk={int(chunk_size)}×{int(seq_len)}, micro={int(micro)})"
+                )
     print(
-        f"[MPS][7B] auto-tune applied (params≈{total_params/1e9:.2f}B): {summary}"
+        f"[MPS][7B] auto-tune applied (params≈{total_params/1e9:.2f}B): {summary}{token_note}"
     )
     return report
 
@@ -2833,6 +2916,37 @@ class AetherTrainerBase:
         self.device = detect_device()
 
         self._mps7b_report = _auto_tune_for_mps_7b(self.model, self.cfg, self.device)
+        self._token_budget = 0
+        self._token_chunk = 0
+        self._token_budget_target = 0
+        self._token_sequence = 0
+        token_report = (
+            self._mps7b_report.get("token_budget")
+            if isinstance(self._mps7b_report, dict)
+            else None
+        )
+        if isinstance(token_report, dict):
+            self._token_budget = int(token_report.get("effective", 0) or 0)
+            self._token_chunk = int(token_report.get("chunk_tokens", 0) or 0)
+            self._token_budget_target = int(token_report.get("target", 0) or 0)
+            self._token_sequence = int(token_report.get("sequence", 0) or 0)
+            if self._token_budget > 0:
+                seq = token_report.get("sequence")
+                chunk = token_report.get("chunk_size")
+                micro = token_report.get("micro")
+                msg = (
+                    f"[MPS][7B] token budget≈{self._token_budget:,}/{max(self._token_budget_target, 1):,}"
+                )
+                detail = []
+                if self._token_chunk > 0:
+                    detail.append(f"chunk≈{self._token_chunk:,}")
+                if chunk and seq:
+                    detail.append(f"layout={int(chunk)}×{int(seq)}")
+                if micro:
+                    detail.append(f"micro={int(micro)}")
+                if detail:
+                    msg += " (" + ", ".join(detail) + ")"
+                print(msg)
 
         matmul_mode = getattr(self.cfg, "matmul_precision", None)
         if matmul_mode:
@@ -3814,6 +3928,17 @@ class AetherTrainerMPS(AetherTrainerBase):
                 step += 1
                 self._global_step = step
 
+                budget_ratio = (
+                    float(total_tok) / float(self._token_budget)
+                    if self._token_budget > 0
+                    else 0.0
+                )
+                chunk_hint = (
+                    float(self._token_chunk)
+                    if self._token_chunk > 0
+                    else float(total_tok)
+                )
+
                 if self._adaptive_micro:
                     if self._micro_active > self._micro_base:
                         self._micro_stable += 1
@@ -4027,6 +4152,13 @@ class AetherTrainerMPS(AetherTrainerBase):
                             "train/tok_s": float(tps),
                             "train/tok_s_ema": float(ema_tps),
                             "train/lr_mult": float(lr_mult),
+                            "train/token_budget_ratio": float(budget_ratio),
+                            "train/token_chunk_hint": float(chunk_hint),
+                            "train/token_budget_target": float(
+                                self._token_budget_target
+                                if self._token_budget_target > 0
+                                else 0.0
+                            ),
                         },
                         step=step,
                     )
@@ -4440,6 +4572,8 @@ def __aether_main__():
     ap.add_argument("--lora_dropout", type=float, default=0.05)
     ap.add_argument("--auto_mps_7b", action="store_true")
     ap.add_argument("--auto_mps_target_seq", type=int, default=4096)
+    ap.add_argument("--auto_mps_token_budget", type=int, default=8192)
+    ap.add_argument("--auto_mps_min_micro_batch", type=int, default=1)
     ap.add_argument("--mps_7b_lora_rank", type=int, default=-1)
     ap.add_argument("--mps_7b_lora_alpha", type=int, default=0)
     ap.add_argument("--mps_7b_lora_dropout", type=float, default=0.05)
@@ -4578,6 +4712,8 @@ def __aether_main__():
         disallow_mps_fallback=not bool(args.allow_mps_cpu_fallback),
         auto_mps_7b=bool(args.auto_mps_7b),
         auto_mps_target_seq=int(args.auto_mps_target_seq),
+        auto_mps_token_budget=max(1, int(args.auto_mps_token_budget)),
+        auto_mps_min_micro_batch=max(1, int(args.auto_mps_min_micro_batch)),
         mps_7b_lora_rank=(
             int(args.mps_7b_lora_rank) if int(args.mps_7b_lora_rank) > 0 else None
         ),
