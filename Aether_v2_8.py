@@ -385,7 +385,8 @@ import threading
 import random
 import types
 from dataclasses import dataclass, field
-from typing import Optional, List, Tuple, Dict, Any
+from typing import Optional, List, Tuple, Dict, Any, Deque
+from collections import deque
 
 try:
     import numpy as _np
@@ -2518,16 +2519,94 @@ class FabricLite:
         print(f"[LOG] step={step} | {ks}")
 
 
+@dataclass(frozen=True)
+class ThroughputSnapshot:
+    ema: float
+    instant: float
+    window_avg: float
+    window_min: float
+    window_max: float
+    window_tokens: float
+    window_seconds: float
+    window_updates: int
+    instant_tokens: float
+    instant_seconds: float
+    lifetime_avg: float
+    lifetime_tokens: float
+    lifetime_seconds: float
+    samples: int
+
+    def as_dict(self) -> Dict[str, float]:
+        return {
+            "ema": float(self.ema),
+            "instant": float(self.instant),
+            "window_avg": float(self.window_avg),
+            "window_min": float(self.window_min),
+            "window_max": float(self.window_max),
+            "window_tokens": float(self.window_tokens),
+            "window_seconds": float(self.window_seconds),
+            "window_updates": float(self.window_updates),
+            "window_size": float(self.window_updates),
+            "instant_tokens": float(self.instant_tokens),
+            "instant_seconds": float(self.instant_seconds),
+            "lifetime_avg": float(self.lifetime_avg),
+            "lifetime_tokens": float(self.lifetime_tokens),
+            "lifetime_seconds": float(self.lifetime_seconds),
+            "samples": float(self.samples),
+        }
+
+
 class ThroughputMeter:
-    def __init__(self, beta: float = 0.90):
+    def __init__(self, beta: float = 0.90, window: int = 8):
         self.beta = float(beta)
         self.value = 0.0
         self.ready = False
+        self.window = max(1, int(window))
+        self._history: Deque[Tuple[float, float, float]] = deque()
+        self._window_tokens = 0.0
+        self._window_seconds = 0.0
+        self._window_min_q: Deque[float] = deque()
+        self._window_max_q: Deque[float] = deque()
+        self._last_inst = 0.0
+        self._last_tokens = 0.0
+        self._last_seconds = 0.0
+        self._updates = 0
+        self.total_tokens = 0.0
+        self.total_seconds = 0.0
+
+    def _evict_oldest(self):
+        if len(self._history) < self.window:
+            return
+        old_tokens, old_seconds, old_inst = self._history.popleft()
+        self._window_tokens -= old_tokens
+        self._window_seconds -= old_seconds
+        if self._window_min_q and self._window_min_q[0] == old_inst:
+            self._window_min_q.popleft()
+        if self._window_max_q and self._window_max_q[0] == old_inst:
+            self._window_max_q.popleft()
 
     def update(self, tokens: float, seconds: float) -> float:
         if seconds <= 0:
             return self.value if self.ready else 0.0
-        inst = float(tokens) / max(seconds, 1e-6)
+        tokens = float(tokens)
+        seconds = float(seconds)
+        inst = tokens / max(seconds, 1e-6)
+        self._evict_oldest()
+        self._history.append((tokens, seconds, inst))
+        self._window_tokens += tokens
+        self._window_seconds += seconds
+        while self._window_min_q and self._window_min_q[-1] > inst:
+            self._window_min_q.pop()
+        self._window_min_q.append(inst)
+        while self._window_max_q and self._window_max_q[-1] < inst:
+            self._window_max_q.pop()
+        self._window_max_q.append(inst)
+        self._last_inst = inst
+        self._last_tokens = tokens
+        self._last_seconds = seconds
+        self._updates += 1
+        self.total_tokens += tokens
+        self.total_seconds += seconds
         if not self.ready:
             self.value = inst
             self.ready = True
@@ -2535,9 +2614,55 @@ class ThroughputMeter:
             self.value = self.beta * self.value + (1.0 - self.beta) * inst
         return self.value
 
+    def snapshot(self) -> ThroughputSnapshot:
+        window_updates = len(self._history)
+        window_avg = (
+            self._window_tokens / self._window_seconds
+            if self._window_seconds > 0
+            else 0.0
+        )
+        window_min = self._window_min_q[0] if window_updates else 0.0
+        window_max = self._window_max_q[0] if window_updates else 0.0
+        lifetime_avg = (
+            self.total_tokens / self.total_seconds
+            if self.total_seconds > 0
+            else 0.0
+        )
+        ema_val = self.value if self.ready else 0.0
+        return ThroughputSnapshot(
+            ema=ema_val,
+            instant=self._last_inst,
+            window_avg=window_avg,
+            window_min=window_min,
+            window_max=window_max,
+            window_tokens=self._window_tokens,
+            window_seconds=self._window_seconds,
+            window_updates=window_updates,
+            instant_tokens=self._last_tokens,
+            instant_seconds=self._last_seconds,
+            lifetime_avg=lifetime_avg,
+            lifetime_tokens=self.total_tokens,
+            lifetime_seconds=self.total_seconds,
+            samples=self._updates,
+        )
+
+    def stats(self) -> Dict[str, float]:
+        return self.snapshot().as_dict()
+
     def reset(self):
         self.ready = False
         self.value = 0.0
+        self._history.clear()
+        self._window_tokens = 0.0
+        self._window_seconds = 0.0
+        self._window_min_q.clear()
+        self._window_max_q.clear()
+        self._last_inst = 0.0
+        self._last_tokens = 0.0
+        self._last_seconds = 0.0
+        self._updates = 0
+        self.total_tokens = 0.0
+        self.total_seconds = 0.0
 
 
 class EMAMeter:
@@ -2989,7 +3114,16 @@ class AetherTrainerBase:
                 print(
                     f"[THROUGHPUT] Invalid AETHER_TPS_EMA_BETA={beta_env!r}; using {tps_beta}"
                 )
-        self._tps_meter = ThroughputMeter(beta=tps_beta)
+        tps_window = int(getattr(self.cfg, "tps_window", 8) or 8)
+        window_env = os.environ.get("AETHER_TPS_WINDOW", "")
+        if window_env:
+            try:
+                tps_window = max(1, int(window_env))
+            except Exception:
+                print(
+                    f"[THROUGHPUT] Invalid AETHER_TPS_WINDOW={window_env!r}; using {tps_window}"
+                )
+        self._tps_meter = ThroughputMeter(beta=tps_beta, window=tps_window)
         self._last_tok_per_sec = 0.0
         self._last_tok_per_sec_ema = 0.0
         ppl_beta = float(getattr(self.cfg, "ppl_smooth_beta", 0.90))
@@ -3921,8 +4055,10 @@ class AetherTrainerMPS(AetherTrainerBase):
                 t0 = time.time()
                 tps = float(total_tok) / max(1e-6, elapsed)
                 ema_tps = self._tps_meter.update(total_tok, elapsed)
+                tps_snapshot = self._tps_meter.snapshot()
+                tps_stats = tps_snapshot.as_dict()
                 self._maybe_boost_throughput(ema_tps)
-                self._last_tok_per_sec = float(tps)
+                self._last_tok_per_sec = float(tps_snapshot.instant)
                 self._last_tok_per_sec_ema = float(ema_tps)
                 lr_mult = sched.step()
                 step += 1
@@ -4151,6 +4287,24 @@ class AetherTrainerMPS(AetherTrainerBase):
                             "train/ppl": float(ppl),
                             "train/tok_s": float(tps),
                             "train/tok_s_ema": float(ema_tps),
+                            "train/tok_s_window": float(tps_stats["window_avg"]),
+                            "train/tok_s_peak": float(tps_stats["window_max"]),
+                            "train/tok_s_lifetime": float(tps_stats["lifetime_avg"]),
+                            "train/tok_window_tokens": float(
+                                tps_stats["window_tokens"]
+                            ),
+                            "train/tok_window_seconds": float(
+                                tps_stats["window_seconds"]
+                            ),
+                            "train/tok_window_updates": float(
+                                tps_stats["window_updates"]
+                            ),
+                            "train/tok_lifetime_tokens": float(
+                                tps_stats["lifetime_tokens"]
+                            ),
+                            "train/tok_lifetime_seconds": float(
+                                tps_stats["lifetime_seconds"]
+                            ),
                             "train/lr_mult": float(lr_mult),
                             "train/token_budget_ratio": float(budget_ratio),
                             "train/token_chunk_hint": float(chunk_hint),
