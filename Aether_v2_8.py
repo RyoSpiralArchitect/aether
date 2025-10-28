@@ -418,7 +418,7 @@ import threading
 import random
 import types
 from dataclasses import dataclass, field
-from typing import Optional, List, Tuple, Dict, Any
+from typing import Optional, List, Tuple, Dict, Any, Union, Deque
 from collections import deque
 
 try:
@@ -2552,27 +2552,74 @@ class FabricLite:
         print(f"[LOG] step={step} | {ks}")
 
 
+@dataclass
+class ThroughputStats:
+    ema: float = 0.0
+    instant: float = 0.0
+    window_avg: float = 0.0
+    window_min: float = 0.0
+    window_max: float = 0.0
+    window_size: int = 0
+    lifetime_avg: float = 0.0
+    lifetime_tokens: float = 0.0
+    lifetime_seconds: float = 0.0
+    samples: int = 0
+
+    def as_dict(self) -> Dict[str, float]:
+        return {
+            "ema": float(self.ema),
+            "instant": float(self.instant),
+            "window_avg": float(self.window_avg),
+            "window_min": float(self.window_min),
+            "window_max": float(self.window_max),
+            "window_size": float(self.window_size),
+            "lifetime_avg": float(self.lifetime_avg),
+            "lifetime_tokens": float(self.lifetime_tokens),
+            "lifetime_seconds": float(self.lifetime_seconds),
+            "samples": float(self.samples),
+        }
+
+
 class ThroughputMeter:
     def __init__(self, beta: float = 0.90, window: int = 8):
         self.beta = float(beta)
         self.value = 0.0
         self.ready = False
         self.window = max(1, int(window))
-        self._history = deque(maxlen=self.window)
+        self._history: Deque[float] = deque()
         self._window_sum = 0.0
+        self._window_min_q: Deque[float] = deque()
+        self._window_max_q: Deque[float] = deque()
         self._last_inst = 0.0
         self._updates = 0
         self.total_tokens = 0.0
         self.total_seconds = 0.0
 
+    def _prune_window(self):
+        while len(self._history) > self.window:
+            oldest = self._history.popleft()
+            self._window_sum -= oldest
+            if self._window_min_q and self._window_min_q[0] == oldest:
+                self._window_min_q.popleft()
+            if self._window_max_q and self._window_max_q[0] == oldest:
+                self._window_max_q.popleft()
+
+    def _push_window_extrema(self, value: float):
+        while self._window_min_q and self._window_min_q[-1] > value:
+            self._window_min_q.pop()
+        self._window_min_q.append(value)
+        while self._window_max_q and self._window_max_q[-1] < value:
+            self._window_max_q.pop()
+        self._window_max_q.append(value)
+
     def update(self, tokens: float, seconds: float) -> float:
         if seconds <= 0:
             return self.value if self.ready else 0.0
         inst = float(tokens) / max(seconds, 1e-6)
-        if len(self._history) == self._history.maxlen:
-            self._window_sum -= self._history[0]
         self._history.append(inst)
         self._window_sum += inst
+        self._push_window_extrema(inst)
+        self._prune_window()
         self._last_inst = inst
         self._updates += 1
         self.total_tokens += float(tokens)
@@ -2584,33 +2631,37 @@ class ThroughputMeter:
             self.value = self.beta * self.value + (1.0 - self.beta) * inst
         return self.value
 
-    def stats(self) -> Dict[str, float]:
-        window_count = len(self._history)
+    def stats(self, as_dict: bool = True) -> Union[ThroughputStats, Dict[str, float]]:
+        window_count = min(len(self._history), self.window)
         window_avg = self._window_sum / window_count if window_count else 0.0
-        window_min = min(self._history) if window_count else 0.0
-        window_max = max(self._history) if window_count else 0.0
+        window_min = self._window_min_q[0] if self._window_min_q else 0.0
+        window_max = self._window_max_q[0] if self._window_max_q else 0.0
         lifetime_avg = (
             self.total_tokens / self.total_seconds
             if self.total_seconds > 0
             else 0.0
         )
-        ema_val = self.value if self.ready else 0.0
-        return {
-            "ema": float(ema_val),
-            "instant": float(self._last_inst),
-            "window_avg": float(window_avg),
-            "window_min": float(window_min),
-            "window_max": float(window_max),
-            "window_size": float(window_count),
-            "lifetime_avg": float(lifetime_avg),
-            "samples": float(self._updates),
-        }
+        stats = ThroughputStats(
+            ema=self.value if self.ready else 0.0,
+            instant=self._last_inst,
+            window_avg=window_avg,
+            window_min=window_min,
+            window_max=window_max,
+            window_size=window_count,
+            lifetime_avg=lifetime_avg,
+            lifetime_tokens=self.total_tokens,
+            lifetime_seconds=self.total_seconds,
+            samples=self._updates,
+        )
+        return stats.as_dict() if as_dict else stats
 
     def reset(self):
         self.ready = False
         self.value = 0.0
         self._history.clear()
         self._window_sum = 0.0
+        self._window_min_q.clear()
+        self._window_max_q.clear()
         self._last_inst = 0.0
         self._updates = 0
         self.total_tokens = 0.0
