@@ -386,6 +386,7 @@ import random
 import types
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple, Dict, Any
+from collections import deque
 
 try:
     import numpy as _np
@@ -2519,15 +2520,30 @@ class FabricLite:
 
 
 class ThroughputMeter:
-    def __init__(self, beta: float = 0.90):
+    def __init__(self, beta: float = 0.90, window: int = 8):
         self.beta = float(beta)
         self.value = 0.0
         self.ready = False
+        self.window = max(1, int(window))
+        self._history = deque(maxlen=self.window)
+        self._window_sum = 0.0
+        self._last_inst = 0.0
+        self._updates = 0
+        self.total_tokens = 0.0
+        self.total_seconds = 0.0
 
     def update(self, tokens: float, seconds: float) -> float:
         if seconds <= 0:
             return self.value if self.ready else 0.0
         inst = float(tokens) / max(seconds, 1e-6)
+        if len(self._history) == self._history.maxlen:
+            self._window_sum -= self._history[0]
+        self._history.append(inst)
+        self._window_sum += inst
+        self._last_inst = inst
+        self._updates += 1
+        self.total_tokens += float(tokens)
+        self.total_seconds += float(seconds)
         if not self.ready:
             self.value = inst
             self.ready = True
@@ -2535,9 +2551,37 @@ class ThroughputMeter:
             self.value = self.beta * self.value + (1.0 - self.beta) * inst
         return self.value
 
+    def stats(self) -> Dict[str, float]:
+        window_count = len(self._history)
+        window_avg = self._window_sum / window_count if window_count else 0.0
+        window_min = min(self._history) if window_count else 0.0
+        window_max = max(self._history) if window_count else 0.0
+        lifetime_avg = (
+            self.total_tokens / self.total_seconds
+            if self.total_seconds > 0
+            else 0.0
+        )
+        ema_val = self.value if self.ready else 0.0
+        return {
+            "ema": float(ema_val),
+            "instant": float(self._last_inst),
+            "window_avg": float(window_avg),
+            "window_min": float(window_min),
+            "window_max": float(window_max),
+            "window_size": float(window_count),
+            "lifetime_avg": float(lifetime_avg),
+            "samples": float(self._updates),
+        }
+
     def reset(self):
         self.ready = False
         self.value = 0.0
+        self._history.clear()
+        self._window_sum = 0.0
+        self._last_inst = 0.0
+        self._updates = 0
+        self.total_tokens = 0.0
+        self.total_seconds = 0.0
 
 
 class EMAMeter:
@@ -3921,6 +3965,7 @@ class AetherTrainerMPS(AetherTrainerBase):
                 t0 = time.time()
                 tps = float(total_tok) / max(1e-6, elapsed)
                 ema_tps = self._tps_meter.update(total_tok, elapsed)
+                tps_stats = self._tps_meter.stats()
                 self._maybe_boost_throughput(ema_tps)
                 self._last_tok_per_sec = float(tps)
                 self._last_tok_per_sec_ema = float(ema_tps)
@@ -4151,6 +4196,9 @@ class AetherTrainerMPS(AetherTrainerBase):
                             "train/ppl": float(ppl),
                             "train/tok_s": float(tps),
                             "train/tok_s_ema": float(ema_tps),
+                            "train/tok_s_window": float(tps_stats["window_avg"]),
+                            "train/tok_s_peak": float(tps_stats["window_max"]),
+                            "train/tok_s_lifetime": float(tps_stats["lifetime_avg"]),
                             "train/lr_mult": float(lr_mult),
                             "train/token_budget_ratio": float(budget_ratio),
                             "train/token_chunk_hint": float(chunk_hint),
