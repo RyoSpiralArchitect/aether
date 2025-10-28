@@ -206,17 +206,50 @@ def _aether_mps_warmup():
                     print(f"[MPS] attention warmup skipped: {e}")
 
         total_elapsed = matmul_elapsed + attn_elapsed
+        matmul_flop = 2.0 * float(size) * float(size) * float(size) * float(steps)
+        matmul_gflops = matmul_flop / max(matmul_elapsed, 1e-9) / 1e9
+        telemetry = {
+            "device": "mps",
+            "dtype": dtype_name,
+            "matmul": {
+                "size": size,
+                "steps": steps,
+                "elapsed_s": matmul_elapsed,
+                "total_flop": matmul_flop,
+                "gflops_per_s": matmul_gflops,
+            },
+        }
         msg = (
             f"[MPS] warmup pumped {steps}x matmul (size={size}, dtype={dtype_name}) "
-            f"in {matmul_elapsed:.3f}s"
+            f"in {matmul_elapsed:.3f}s (~{matmul_gflops:,.1f} GFLOP/s)"
         )
         if attn_enable and attn_elapsed > 0.0:
+            telemetry["attention"] = {
+                "steps": attn_steps,
+                "heads": attn_heads,
+                "seq": attn_seq,
+                "head_dim": attn_dim,
+                "elapsed_s": attn_elapsed,
+                "tokens_per_s": attn_tok_per_sec,
+            }
             msg += (
                 f"; attention warmup {attn_steps}x (seq={attn_seq}, heads={attn_heads}, "
                 f"dim={attn_dim}) in {attn_elapsed:.3f}s (~{attn_tok_per_sec:,.0f} tok/s)"
             )
         msg += f" [total {total_elapsed:.3f}s]"
         print(msg)
+        export_path = _aos.environ.get("AETHER_MPS_WARMUP_EXPORT")
+        if export_path:
+            try:
+                import json as _json
+
+                with open(export_path, "w", encoding="utf-8") as _fh:
+                    _json.dump(telemetry, _fh, indent=2, sort_keys=True)
+                print(f"[MPS] warmup telemetry exported to {export_path!r}")
+            except Exception as e:
+                print(
+                    f"[MPS] failed to export telemetry to {export_path!r}: {e}"
+                )
     except Exception as e:
         print(f"[MPS] warmup failed: {e}")
 
