@@ -2274,7 +2274,7 @@ class TrainConfig:
     loader_pin_memory: bool = False
     prefetch_to_device: bool = True
     disallow_mps_fallback: bool = True
-    auto_mps_7b: bool = False
+    auto_mps_7b: bool = True
     auto_mps_param_threshold: int = 5_000_000_000
     auto_mps_target_seq: int = 4096
     auto_mps_token_budget: int = 8192
@@ -4610,6 +4610,88 @@ def save_lora_safetensors_if_any(model, out_dir: str, step: int):
         return False
 
 
+def _coerce_config_value(value: Any, template: Any) -> Any:
+    if template is None:
+        return value
+    try:
+        if isinstance(template, bool):
+            if isinstance(value, str):
+                return value.strip().lower() in {"1", "true", "yes", "on"}
+            return bool(value)
+        if isinstance(template, int) and not isinstance(template, bool):
+            if isinstance(value, bool):
+                return int(value)
+            return int(value)
+        if isinstance(template, float):
+            return float(value)
+        if isinstance(template, str):
+            return str(value)
+    except Exception:
+        return value
+    return value
+
+
+def _resolve_config_path(path: str) -> str:
+    if not path:
+        return ""
+    expanded = os.path.expanduser(path)
+    if os.path.isdir(expanded):
+        for candidate in (
+            "aether.config.json",
+            "aether_config.json",
+            "config.json",
+        ):
+            sub = os.path.join(expanded, candidate)
+            if os.path.isfile(sub):
+                return os.path.abspath(sub)
+        return ""
+    if os.path.isfile(expanded):
+        return os.path.abspath(expanded)
+    return ""
+
+
+def _auto_detect_config_path() -> str:
+    cwd = os.getcwd()
+    candidates = [
+        os.path.join(cwd, "aether.config.json"),
+        os.path.join(cwd, "aether_config.json"),
+        os.path.join(cwd, "config", "aether.json"),
+        os.path.join(cwd, "config", "config.json"),
+        os.path.join(cwd, "configs", "aether.json"),
+        os.path.join(cwd, "config.json"),
+    ]
+    for cand in candidates:
+        if os.path.isfile(cand):
+            return os.path.abspath(cand)
+    config_dir = os.path.join(cwd, "configs")
+    try:
+        jsons = [
+            os.path.join(config_dir, name)
+            for name in os.listdir(config_dir)
+            if name.lower().endswith(".json")
+        ]
+        if len(jsons) == 1 and os.path.isfile(jsons[0]):
+            return os.path.abspath(jsons[0])
+    except OSError:
+        pass
+    return ""
+
+
+def _load_config_overrides(path: str) -> Dict[str, Any]:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        print(f"[CONFIG] failed to load {path!r}: {exc}")
+        return {}
+    if not isinstance(data, dict):
+        print(f"[CONFIG] {path!r} does not contain a JSON object; ignoring")
+        return {}
+    return data
+
+
 def __aether_main__():
     def _require_mps():
         if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
@@ -4626,6 +4708,12 @@ def __aether_main__():
 
     ap = argparse.ArgumentParser()
     # data
+    ap.add_argument(
+        "--config",
+        type=str,
+        default="",
+        help="Path to config JSON (auto-detected if omitted)",
+    )
     ap.add_argument("--demo", action="store_true")
     ap.add_argument("--train_stream", action="store_true")
     ap.add_argument("--train_glob", type=str, default="")
@@ -4703,6 +4791,7 @@ def __aether_main__():
     ap.add_argument("--lora_alpha", type=int, default=320)
     ap.add_argument("--lora_dropout", type=float, default=0.05)
     ap.add_argument("--auto_mps_7b", action="store_true")
+    ap.add_argument("--no_auto_mps_7b", action="store_true")
     ap.add_argument("--auto_mps_target_seq", type=int, default=4096)
     ap.add_argument("--auto_mps_token_budget", type=int, default=8192)
     ap.add_argument("--auto_mps_min_micro_batch", type=int, default=1)
@@ -4724,10 +4813,66 @@ def __aether_main__():
         default=0,
         help="Save LoRA weights to safetensors every N steps (0=off)",
     )
+    defaults = ap.parse_args([])
     args = ap.parse_args()
 
-    set_seed(1337)
+    config_candidates = []
+    if getattr(args, "config", ""):
+        config_candidates.append(args.config)
+    env_cfg = os.environ.get("AETHER_CONFIG", "").strip()
+    if env_cfg:
+        config_candidates.append(env_cfg)
+    auto_cfg = _auto_detect_config_path()
+    if auto_cfg:
+        config_candidates.append(auto_cfg)
+
+    config_path = ""
+    overrides: Dict[str, Any] = {}
+    for cand in config_candidates:
+        resolved = _resolve_config_path(cand)
+        if not resolved:
+            continue
+        overrides = _load_config_overrides(resolved)
+        config_path = resolved
+        if overrides:
+            break
+    if config_path:
+        args.config = config_path
+    override_keys = set()
+    if overrides:
+        print(f"[CONFIG] loaded overrides from {config_path}")
+        for key, value in overrides.items():
+            if key == "config" or not hasattr(args, key):
+                continue
+            if not hasattr(defaults, key):
+                continue
+            current = getattr(args, key)
+            default_value = getattr(defaults, key)
+            if current != default_value:
+                continue
+            coerced = _coerce_config_value(value, default_value)
+            try:
+                setattr(args, key, coerced)
+                override_keys.add(key)
+                print(f"[CONFIG] {key} <- {coerced!r}")
+            except Exception as exc:
+                print(f"[CONFIG] failed to apply {key!r}: {exc}")
+    elif config_path:
+        print(f"[CONFIG] detected {config_path} (no overrides applied)")
+
     device = detect_device()
+
+    if getattr(args, "no_auto_mps_7b", False):
+        args.auto_mps_7b = False
+    elif (
+        getattr(args, "auto_mps_7b", False) == getattr(defaults, "auto_mps_7b", False)
+        and "auto_mps_7b" not in override_keys
+        and device.type == "mps"
+    ):
+        args.auto_mps_7b = True
+        print("[CONFIG] auto_mps_7b enabled by default (MPS detected)")
+
+    set_seed(1337)
 
     tok = ByteTokenizer(vocab_size=args.vocab_size)
     kvh = args.kv_heads if args.kv_heads and args.kv_heads > 0 else None
