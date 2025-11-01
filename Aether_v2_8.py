@@ -450,6 +450,16 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
 
 from torch.amp import GradScaler
 
+try:  # SentencePiece is optional; tokenizer gracefully degrades without it
+    import sentencepiece as _sentencepiece
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    _sentencepiece = None
+
+try:  # TikToken-style encodings are optional as well
+    import tiktoken as _tiktoken
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    _tiktoken = None
+
 
 def _aether_detect_mps() -> bool:
     try:
@@ -1206,12 +1216,25 @@ except Exception:
     _KBRIDGE_AVAILABLE = False
 
 
+# Track tokenizer layout so analytics can adapt to hybrid vocabularies
+_AETHER_TOKENIZER_LAYOUT: Dict[str, Any] = {
+    "byte_base": 3,
+    "byte_count": 256,
+    "sp_base": None,
+    "sp_size": 0,
+    "tt_base": None,
+    "tt_size": 0,
+}
+
+
 # === Class grouping helpers (ByteTokenizer-aware; fallback-safe) =============
 def _build_classmap(vocab_size: int, scheme: str = "byte-basic", json_path: str = ""):
     """
     Returns: (classmap_np[int32, shape=(vocab_size,)], group_names[list[str]])
     scheme: "byte-basic" | "byte-compact" | "custom-json"
-    - ByteTokenizer: PAD=0, BOS=1, EOS=2, bytes: id=3..258 => b=0..255
+    - ByteTokenizer hybrid: PAD=0, BOS=1, EOS=2, optional SentencePiece/TikToken
+      ranges, and (if enabled) byte fallback tokens. Byte ranges are detected via
+      _AETHER_TOKENIZER_LAYOUT.
     Groups (byte-basic):
       0=control(<32,127 except whitespace), 1=whitespace, 2=digit, 3=alpha,
       4=punct, 5=ascii-other, 6=non-ascii(>=128), 7=special(PAD/BOS/EOS/others)
@@ -1253,24 +1276,33 @@ def _build_classmap(vocab_size: int, scheme: str = "byte-basic", json_path: str 
                 return m, names
         except Exception:
             pass
-    # byte-based
-    for tid in range(3, min(vocab_size, 259)):
-        b = tid - 3
-        if b < 32 or b == 127:  # control
-            if b in (9, 10, 11, 12, 13):
+    layout = _AETHER_TOKENIZER_LAYOUT or {}
+    byte_base = layout.get("byte_base", 3)
+    byte_count = layout.get("byte_count", 256)
+    if not isinstance(byte_base, int):
+        byte_base = 3
+    if not isinstance(byte_count, int):
+        byte_count = 256
+    byte_count = max(0, min(byte_count, max(0, vocab_size - byte_base)))
+    if byte_count and byte_base < vocab_size:
+        end = min(vocab_size, byte_base + byte_count)
+        for tid in range(byte_base, end):
+            b = tid - byte_base
+            if b < 32 or b == 127:  # control
+                if b in (9, 10, 11, 12, 13):
+                    m[tid] = 1  # whitespace
+                else:
+                    m[tid] = 0
+            elif b == 32 or b in (9, 10, 11, 12, 13):
                 m[tid] = 1  # whitespace
+            elif 48 <= b <= 57:
+                m[tid] = 2  # digit
+            elif 65 <= b <= 90 or 97 <= b <= 122:
+                m[tid] = 3  # alpha
+            elif b <= 127:
+                m[tid] = 4 if chr(b) in string.punctuation else 5
             else:
-                m[tid] = 0
-        elif b == 32 or b in (9, 10, 11, 12, 13):
-            m[tid] = 1  # whitespace
-        elif 48 <= b <= 57:
-            m[tid] = 2  # digit
-        elif 65 <= b <= 90 or 97 <= b <= 122:
-            m[tid] = 3  # alpha
-        elif b <= 127:
-            m[tid] = 4 if chr(b) in string.punctuation else 5
-        else:
-            m[tid] = 6  # non-ASCII
+                m[tid] = 6  # non-ASCII
     if scheme == "byte-compact":
         # merge some buckets: asciiOther->punct, control->whitespace
         m[np_mod.where(m == 5)] = 4
@@ -1775,20 +1807,245 @@ def convert_linear_to_int8_lora(
 
 # ====== Tokenizer (Byte-level; PAD/BOS/EOS) ==================================
 class ByteTokenizer:
+    """Hybrid tokenizer that blends byte, SentencePiece, and TikToken encodings.
+
+    The legacy byte-level behaviour is preserved as a fallback, while optional
+    SentencePiece and TikToken vocabularies can be layered on top when the
+    corresponding libraries/models are available. At runtime the tokenizer picks
+    whichever sub-tokenization yields the fewest tokens for a given fragment,
+    enabling compact yet expressive sequences without sacrificing robustness.
+    """
+
     PAD = 0
     BOS = 1
     EOS = 2
 
-    def __init__(self, vocab_size=32000):
-        self.vocab_size = vocab_size
+    def __init__(
+        self,
+        vocab_size: int = 32000,
+        sp_model_path: Optional[str] = None,
+        sp_model_proto: Optional[bytes] = None,
+        tiktoken_encoding: Optional[str] = None,
+        byte_fallback: bool = True,
+    ):
+        self._sp = None
+        self._sp_vocab = 0
+        self._tt = None
+        self._tt_vocab = 0
+        self._byte_fallback = bool(byte_fallback)
 
+        info_bits: List[str] = []
+
+        if _sentencepiece is not None and (sp_model_path or sp_model_proto):
+            proc = _sentencepiece.SentencePieceProcessor()
+            try:
+                if sp_model_proto is not None:
+                    proc.LoadFromSerializedProto(sp_model_proto)
+                elif sp_model_path is not None:
+                    proc.Load(sp_model_path)
+                self._sp_vocab = int(proc.get_piece_size())
+                if self._sp_vocab > 0:
+                    self._sp = proc
+                    info_bits.append(f"sentencepiece={self._sp_vocab}")
+                else:
+                    print("[TOK] SentencePiece model has no vocabulary; disabling")
+            except Exception as exc:
+                print(f"[TOK] Failed to load SentencePiece model: {exc}")
+        elif sp_model_path and _sentencepiece is None:
+            print(
+                f"[TOK] sentencepiece package is unavailable; requested model {sp_model_path!r} ignored"
+            )
+
+        if tiktoken_encoding and _tiktoken is not None:
+            try:
+                enc = _tiktoken.get_encoding(tiktoken_encoding)
+                vocab = int(getattr(enc, "n_vocab", 0))
+                if vocab > 0:
+                    self._tt = enc
+                    self._tt_vocab = vocab
+                    info_bits.append(f"tiktoken={tiktoken_encoding}:{vocab}")
+                else:
+                    print(
+                        f"[TOK] TikToken encoding {tiktoken_encoding!r} has zero vocab; disabling"
+                    )
+            except Exception as exc:
+                print(f"[TOK] Failed to load TikToken encoding {tiktoken_encoding!r}: {exc}")
+        elif tiktoken_encoding and _tiktoken is None:
+            print(
+                f"[TOK] tiktoken package is unavailable; requested encoding {tiktoken_encoding!r} ignored"
+            )
+
+        self._sp_base = self.EOS + 1
+        offset = self._sp_base
+        if self._sp is not None and self._sp_vocab > 0:
+            self._sp_base = offset
+            offset += self._sp_vocab
+        else:
+            self._sp_base = offset
+
+        self._tt_base = offset
+        if self._tt is not None and self._tt_vocab > 0:
+            self._tt_base = offset
+            offset += self._tt_vocab
+
+        self._byte_base = offset
+        if self._byte_fallback:
+            offset += 256
+            info_bits.append("byte-fallback")
+        else:
+            info_bits.append("no-byte-fallback")
+
+        self._total_vocab = offset
+        self.vocab_size = max(int(vocab_size), self._total_vocab)
+        if self.vocab_size > self._total_vocab:
+            info_bits.append(f"pad={self.vocab_size - self._total_vocab}")
+
+        if not info_bits:
+            info_bits.append("pure-byte")
+
+        global _AETHER_TOKENIZER_LAYOUT
+        _AETHER_TOKENIZER_LAYOUT = {
+            "byte_base": self._byte_base if self._byte_fallback else None,
+            "byte_count": 256 if self._byte_fallback else 0,
+            "sp_base": self._sp_base if self._sp is not None else None,
+            "sp_size": self._sp_vocab if self._sp is not None else 0,
+            "tt_base": self._tt_base if self._tt is not None else None,
+            "tt_size": self._tt_vocab if self._tt is not None else 0,
+        }
+
+        print(
+            f"[TOK] Hybrid tokenizer ready ({', '.join(info_bits)}) → vocab={self.vocab_size}"
+        )
+
+    # ------------------------------------------------------------------ helpers
+    def _encode_bytes(self, segment: str) -> List[int]:
+        if not self._byte_fallback:
+            return []
+        data = segment.encode("utf-8", errors="ignore")
+        if not data:
+            return []
+        return [self._byte_base + int(b) for b in data]
+
+    def _sp_piece_to_id(self, piece: str) -> Optional[int]:
+        if self._sp is None:
+            return None
+        try:
+            pid = int(self._sp.piece_to_id(piece))
+        except Exception:
+            return None
+        return pid if pid >= 0 else None
+
+    # ---------------------------------------------------------------- interface
     def encode(self, s: str) -> List[int]:
-        b = s.encode("utf-8", errors="ignore")[: self.vocab_size - 3]
-        return [self.BOS] + [int(x) + 3 for x in b] + [self.EOS]
+        if not isinstance(s, str):
+            s = str(s)
+
+        tokens: List[int] = [self.BOS]
+        segments: List[str]
+        if self._sp is not None:
+            try:
+                segments = self._sp.encode(s, out_type=str)
+            except Exception:
+                segments = [s]
+        else:
+            segments = [s]
+
+        for seg in segments:
+            best: Optional[List[int]] = None
+
+            if self._sp is not None:
+                pid = self._sp_piece_to_id(seg)
+                if pid is not None and 0 <= pid < self._sp_vocab:
+                    best = [self._sp_base + pid]
+
+            if self._tt is not None:
+                try:
+                    tt_raw = self._tt.encode(seg)
+                except Exception:
+                    tt_raw = []
+                tt_ids = [self._tt_base + int(tid) for tid in tt_raw if tid < self._tt_vocab]
+                if tt_ids and (best is None or len(tt_ids) < len(best)):
+                    best = tt_ids
+
+            if not best:
+                best = self._encode_bytes(seg)
+
+            if not best:
+                # Absolute fallback: character-wise (may still be empty for whitespace)
+                for ch in seg:
+                    ch_ids = self._encode_bytes(ch)
+                    if ch_ids:
+                        tokens.extend(ch_ids)
+                continue
+
+            tokens.extend(best)
+
+        tokens.append(self.EOS)
+        return tokens
 
     def decode(self, ids: List[int]) -> str:
-        b = [max(0, min(255, i - 3)) for i in ids if i >= 3]
-        return bytes(b).decode("utf-8", errors="ignore")
+        pieces: List[str] = []
+
+        sp_buffer: List[int] = []
+        tt_buffer: List[int] = []
+
+        def _flush_sp():
+            if not sp_buffer or self._sp is None:
+                sp_buffer.clear()
+                return
+            try:
+                pieces.append(self._sp.decode_ids(sp_buffer))
+            except Exception:
+                for pid in sp_buffer:
+                    try:
+                        pieces.append(self._sp.id_to_piece(pid))
+                    except Exception:
+                        continue
+            finally:
+                sp_buffer.clear()
+
+        def _flush_tt():
+            if not tt_buffer or self._tt is None:
+                tt_buffer.clear()
+                return
+            try:
+                pieces.append(self._tt.decode(tt_buffer))
+            except Exception:
+                for tid in tt_buffer:
+                    try:
+                        pieces.append(self._tt.decode([tid]))
+                    except Exception:
+                        continue
+            finally:
+                tt_buffer.clear()
+
+        for tid in ids:
+            if tid in (self.PAD, self.BOS, self.EOS):
+                continue
+            if self._sp is not None and self._sp_base <= tid < self._sp_base + self._sp_vocab:
+                _flush_tt()
+                sp_buffer.append(int(tid - self._sp_base))
+                continue
+            if self._tt is not None and self._tt_base <= tid < self._tt_base + self._tt_vocab:
+                _flush_sp()
+                tt_buffer.append(int(tid - self._tt_base))
+                continue
+
+            _flush_sp()
+            _flush_tt()
+
+            if self._byte_fallback and self._byte_base <= tid < self._byte_base + 256:
+                pieces.append(
+                    bytes([int(tid - self._byte_base)]).decode("utf-8", errors="ignore")
+                )
+
+        _flush_sp()
+        _flush_tt()
+
+        text = "".join(pieces)
+        if self._sp is not None:
+            text = text.replace("\u2581", " ")
+        return text
 
 
 # ====== RMSNorm / SwiGLU / Rotary ===========================================
@@ -2285,6 +2542,14 @@ class TrainConfig:
     mps_7b_lora_dropout: float = 0.05
     mps_7b_int8_exclude: Tuple[str, ...] = ("emb", "head")
     mps_7b_skip_if_out_equals: Optional[int] = None
+    # Turbo governor (MPS throughput tuning)
+    turbo_target_tok: float = 2000.0
+    turbo_window: int = 6
+    turbo_cooldown: int = 48
+    turbo_seq_floor: int = 512
+    turbo_seq_step: int = 256
+    turbo_disable_metrics_ratio: float = 0.75
+    turbo_micro_floor: int = 1
 
 
 def _auto_tune_for_mps_7b(
@@ -2441,6 +2706,22 @@ def _auto_tune_for_mps_7b(
         "tps_boost_patience",
         cfg.tps_boost_patience,
         max(cfg.tps_boost_patience, 16),
+    )
+    cfg.turbo_target_tok = _update(
+        "turbo_target_tok", cfg.turbo_target_tok, max(cfg.turbo_target_tok, 2000.0)
+    )
+    cfg.turbo_seq_floor = _update(
+        "turbo_seq_floor", cfg.turbo_seq_floor, max(128, min(cfg.turbo_seq_floor, target_seq))
+    )
+    cfg.turbo_seq_step = _update(
+        "turbo_seq_step",
+        cfg.turbo_seq_step,
+        max(cfg.turbo_seq_step, max(64, target_seq // 4)),
+    )
+    cfg.turbo_micro_floor = _update(
+        "turbo_micro_floor",
+        cfg.turbo_micro_floor,
+        max(cfg.turbo_micro_floor, min_micro),
     )
 
     env_updates: Dict[str, Any] = {}
@@ -2667,6 +2948,142 @@ class ThroughputMeter:
         self._updates = 0
         self.total_tokens = 0.0
         self.total_seconds = 0.0
+
+
+class MPSTurboGovernor:
+    """Adaptive throughput governor targeting >2k tok/s on MPS."""
+
+    def __init__(
+        self,
+        trainer,
+        *,
+        target_tok: float,
+        window: int,
+        cooldown: int,
+        micro_floor: int,
+        seq_floor: int,
+        seq_step: int,
+        disable_metrics_ratio: float,
+    ):
+        self.trainer = trainer
+        self.target = max(0.0, float(target_tok))
+        self.window = max(1, int(window))
+        self.cooldown = max(1, int(cooldown))
+        self.micro_floor = max(1, int(micro_floor))
+        self.seq_floor = max(128, int(seq_floor))
+        self.seq_step = max(32, int(seq_step))
+        self.disable_metrics_ratio = float(min(max(disable_metrics_ratio, 0.0), 0.99))
+        base_candidates = [
+            int(getattr(trainer.cfg, "max_len", 0) or 0),
+            int(getattr(trainer, "_token_sequence", 0) or 0),
+        ]
+        self.base_seq = max([c for c in base_candidates if c > 0] or [2048])
+        self.enabled = self.target > 0.0 and getattr(trainer.device, "type", "cpu") == "mps"
+        self.low_strike = 0
+        self.high_strike = 0
+        self.last_adjust = -10**9
+        self.best = 0.0
+        self.history: Deque[float] = deque(maxlen=self.window)
+
+    def _shed_metrics(self, step: int, ema: float, low_bar: float):
+        tr = self.trainer
+        if not getattr(tr, "_turbo_metrics_suppressed", False):
+            print(
+                f"[TURBO] shedding auxiliary metrics (ema={ema:.1f} < {low_bar:.1f} tok/s)"
+            )
+        tr._turbo_metrics_suppressed = True
+        tr._turbo_metrics_release_step = step + self.cooldown
+        tr._turbo_disable_kbridge = True
+
+    def _restore_metrics(self):
+        tr = self.trainer
+        if getattr(tr, "_turbo_metrics_suppressed", False):
+            print("[TURBO] auxiliary metrics restored")
+        tr._turbo_metrics_suppressed = False
+        tr._turbo_disable_kbridge = False
+
+    def update(
+        self,
+        step: int,
+        instant_tps: float,
+        ema_tps: float,
+        stats: ThroughputStats,
+        total_tok: int,
+        chunk_hint: float,
+    ):
+        if not self.enabled:
+            return
+        chunk_hint_val = float(chunk_hint) if chunk_hint is not None else float(total_tok)
+        window_peak = getattr(stats, "window_max", float(instant_tps))
+        self.best = max(self.best, float(max(window_peak, instant_tps)))
+        self.history.append(float(ema_tps))
+        low_bar = self.target * max(0.25, self.disable_metrics_ratio)
+        high_bar = self.target * 0.97 if self.target > 0 else float("inf")
+
+        if ema_tps < low_bar:
+            self.low_strike += 1
+            self.high_strike = 0
+            self._shed_metrics(step, ema_tps, low_bar)
+        elif (
+            getattr(self.trainer, "_turbo_metrics_suppressed", False)
+            and ema_tps >= self.target * 0.9
+            and step >= getattr(self.trainer, "_turbo_metrics_release_step", 0)
+        ):
+            self._restore_metrics()
+            self.low_strike = 0
+            self.high_strike += 1
+        elif ema_tps > high_bar:
+            self.low_strike = 0
+            self.high_strike += 1
+        else:
+            self.low_strike = 0
+            self.high_strike = 0
+
+        if (
+            self.low_strike >= self.window
+            and (step - self.last_adjust) >= self.cooldown
+        ):
+            tr = self.trainer
+            current_micro = max(1, int(getattr(tr, "_micro_active", 1)))
+            if current_micro > max(self.micro_floor, int(getattr(tr, "_micro_base", 1)) // 2):
+                new_micro = max(self.micro_floor, current_micro - 1)
+                if new_micro < current_micro:
+                    tr._micro_active = new_micro
+                    tr._micro_stable = 0
+                    print(
+                        f"[TURBO] micro_batch tightened to {new_micro} (ema={ema_tps:.1f} tok/s, target={self.target:.1f}, chunk≈{chunk_hint_val:.0f})"
+                    )
+                    self.last_adjust = step
+                    return
+            base_seq = max(self.base_seq, int(getattr(tr.cfg, "max_len", self.base_seq)))
+            current_cap = int(getattr(tr, "_turbo_max_len", 0) or base_seq)
+            new_cap = max(self.seq_floor, current_cap - self.seq_step)
+            if new_cap < current_cap:
+                tr._turbo_set_sequence_cap(new_cap)
+                self.last_adjust = step
+                return
+
+        if (
+            self.high_strike >= self.window
+            and (step - self.last_adjust) >= self.cooldown
+        ):
+            tr = self.trainer
+            changed = False
+            if getattr(tr, "_turbo_max_len", 0):
+                changed = tr._turbo_relax_sequence_cap(self.seq_step)
+            if not changed and int(getattr(tr, "_micro_active", 1)) < int(
+                getattr(tr, "_micro_base", 1)
+            ):
+                tr._micro_active = min(
+                    int(tr._micro_base), int(tr._micro_active) + 1
+                )
+                tr._micro_stable = 0
+                print(
+                    f"[TURBO] micro_batch relaxed to {tr._micro_active} (ema={ema_tps:.1f} tok/s, chunk≈{chunk_hint_val:.0f})"
+                )
+                changed = True
+            if changed:
+                self.last_adjust = step
 
 
 class EMAMeter:
@@ -3138,6 +3555,17 @@ class AetherTrainerBase:
 
         wd = 0.01
 
+        self._strict_loss_guard = os.environ.get("AETHER_STRICT_LOSS_GUARD", "1") != "0"
+        self._strict_activation_guard = (
+            os.environ.get("AETHER_STRICT_ACT_GUARD", "0") != "0"
+        )
+        self._suppress_numeric_traceback = (
+            os.environ.get("AETHER_SUPPRESS_NUMERIC_TRACEBACK", "1") != "0"
+        )
+        self._nonfinite_event_verbose = (
+            os.environ.get("AETHER_NONFINITE_VERBOSE", "1") != "0"
+        )
+
         # ultramem optimizer factory (if autopatch installed)
         if (up is not None) and hasattr(self.model, "_ultramem_make_optimizer"):
             self.opt = self.model._ultramem_make_optimizer(lr=self.cfg.lr, wd=wd)
@@ -3266,6 +3694,36 @@ class AetherTrainerBase:
             print(
                 f"[ADAPT] micro_batch base={self._micro_base}, cap={self._micro_cap}"
             )
+        self._micro_floor = max(1, int(getattr(self.cfg, "turbo_micro_floor", 1)))
+        if self._micro_active < self._micro_floor:
+            self._micro_active = self._micro_floor
+        if self._micro_base < self._micro_floor:
+            self._micro_base = self._micro_floor
+        if self._micro_cap < self._micro_floor:
+            self._micro_cap = self._micro_floor
+        self._turbo_seq_step = max(32, int(getattr(self.cfg, "turbo_seq_step", 256)))
+        self._turbo_seq_floor = max(128, int(getattr(self.cfg, "turbo_seq_floor", 512)))
+        base_seq_candidates = [
+            int(getattr(self.cfg, "max_len", 0) or 0),
+            int(self._token_sequence or 0),
+        ]
+        self._turbo_base_seq = max([c for c in base_seq_candidates if c > 0] or [self.cfg.max_len])
+        self._turbo_max_len = 0
+        self._turbo_metrics_suppressed = False
+        self._turbo_metrics_release_step = 0
+        self._turbo_disable_kbridge = False
+        self._turbo = MPSTurboGovernor(
+            self,
+            target_tok=float(getattr(self.cfg, "turbo_target_tok", 0.0)),
+            window=int(getattr(self.cfg, "turbo_window", 6)),
+            cooldown=int(getattr(self.cfg, "turbo_cooldown", 48)),
+            micro_floor=self._micro_floor,
+            seq_floor=self._turbo_seq_floor,
+            seq_step=self._turbo_seq_step,
+            disable_metrics_ratio=float(
+                getattr(self.cfg, "turbo_disable_metrics_ratio", 0.75)
+            ),
+        )
         # --- k-bridge integration knobs (safe opt-in; default on if installed) ---
         requested_k = bool(
             int(os.environ.get("KBRIDGE_ENABLE", "1" if _KBRIDGE_AVAILABLE else "0"))
@@ -3398,6 +3856,51 @@ class AetherTrainerBase:
         tensors, stream = self._device_async_copy(*batch)
         self._wait_stream(stream)
         return tensors
+
+    def _turbo_set_sequence_cap(self, new_cap: int):
+        base = max(1, int(self._turbo_base_seq))
+        new_cap = int(new_cap)
+        if new_cap <= 0 or new_cap >= base:
+            if self._turbo_max_len != 0:
+                print(
+                    f"[TURBO] sequence cap cleared; full {base}-token context restored"
+                )
+            self._turbo_max_len = 0
+            return
+        if self._turbo_max_len == new_cap:
+            return
+        self._turbo_max_len = new_cap
+        print(f"[TURBO] sequence cap set to {new_cap} tokens (base={base})")
+
+    def _turbo_relax_sequence_cap(self, step_size: int) -> bool:
+        if self._turbo_max_len <= 0:
+            return False
+        base = max(1, int(self._turbo_base_seq))
+        step_size = max(1, int(step_size))
+        new_cap = min(base, self._turbo_max_len + step_size)
+        if new_cap >= base:
+            self._turbo_max_len = 0
+            print(
+                f"[TURBO] sequence cap cleared; full {base}-token context restored"
+            )
+            return True
+        if new_cap != self._turbo_max_len:
+            self._turbo_max_len = new_cap
+            print(f"[TURBO] sequence cap relaxed to {new_cap}")
+            return True
+        return False
+
+    def _turbo_update(
+        self,
+        step: int,
+        instant_tps: float,
+        ema_tps: float,
+        stats: ThroughputStats,
+        total_tok: int,
+        chunk_hint: float,
+    ):
+        if isinstance(getattr(self, "_turbo", None), MPSTurboGovernor):
+            self._turbo.update(step, instant_tps, ema_tps, stats, total_tok, chunk_hint)
 
     def _stabilize_loss_value(self, loss_avg: float) -> float:
         guard = max(0.0, self._loss_guard)
@@ -3673,6 +4176,8 @@ class AetherTrainerMPS(AetherTrainerBase):
                 return None
             params = curr_params(int(step_hint))
             max_len = int(params.get("max_len", bx.size(1)))
+            if getattr(self, "_turbo_max_len", 0):
+                max_len = min(max_len, int(self._turbo_max_len))
             if max_len < bx.size(1):
                 bx = bx[:, :max_len]
                 by = by[:, :max_len]
@@ -3736,6 +4241,12 @@ class AetherTrainerMPS(AetherTrainerBase):
                     total_tok = 0
                     accum = 0
                     idx = 0
+                    total_loss_tensor = torch.zeros(
+                        (), device=self.device, dtype=torch.float32
+                    )
+                    total_tok_tensor = torch.zeros(
+                        (), device=self.device, dtype=torch.float32
+                    )
                     restart_batch = False
                     batch_on_device = device_cache
                     batch_stream = None
@@ -3810,6 +4321,16 @@ class AetherTrainerMPS(AetherTrainerBase):
                                 device_type="mps", dtype=self.amp_dtype
                             ):
                                 logits, lvi_logs = self._compute_logits(subx)
+                                if self._strict_activation_guard:
+                                    logits = self._sanitize_tensor(
+                                        logits, "forward.logits", step
+                                    )
+                                if isinstance(lvi_logs, dict):
+                                    for _lk in ("mv_reg", "two_view"):
+                                        if _lk in lvi_logs:
+                                            lvi_logs[_lk] = self._sanitize_loss_value(
+                                                lvi_logs[_lk], f"lvi.{_lk}", step
+                                            )
                                 _pf = {}
                                 try:
                                     _pf = self._ai.post_forward_assess(
@@ -3820,6 +4341,9 @@ class AetherTrainerMPS(AetherTrainerBase):
                             # ★ CE は常に FP32・autocast 無効で計算（数値安定のため）
                             with torch.autocast(device_type="mps", enabled=False):
                                 loss_ce = self._ce_loss(logits, suby, pad_id)
+                                loss_ce = self._sanitize_loss_value(
+                                    loss_ce, "loss_ce", step
+                                )
                                 loss = (
                                     loss_ce
                                     + float(self.cfg.lvi_mv_weight) * lvi_logs["mv_reg"]
@@ -3853,9 +4377,11 @@ class AetherTrainerMPS(AetherTrainerBase):
                                             t_pos = self._teacher(subx).to(
                                                 E_bar.device, dtype=E_bar.dtype
                                             )
-                                        loss = loss + float(self._k_reg_w) * khuber_loss(
-                                            E_bar, t_pos, delta=1.0
+                                        reg = khuber_loss(E_bar, t_pos, delta=1.0)
+                                        reg = self._sanitize_loss_value(
+                                            reg, "kbridge", step
                                         )
+                                        loss = loss + float(self._k_reg_w) * reg
                                     except Exception:
                                         pass
 
@@ -3893,6 +4419,9 @@ class AetherTrainerMPS(AetherTrainerBase):
                                                         )
                                                     ),
                                                 )
+                                                loss_int = self._sanitize_loss_value(
+                                                    loss_int, "intent_loss", step
+                                                )
                                                 loss = (
                                                     loss
                                                     + float(self.cfg.intent_weight)
@@ -3901,7 +4430,11 @@ class AetherTrainerMPS(AetherTrainerBase):
                                         except Exception:
                                             pass
 
+                                loss = self._sanitize_loss_value(loss, "loss", step)
                                 loss = loss / max(1, current_micro)
+                                loss = self._sanitize_loss_value(
+                                    loss, "loss_scaled", step
+                                )
                         except RuntimeError as e:
                             if self._maybe_handle_oom(e, B):
                                 restart_batch = True
@@ -3917,6 +4450,7 @@ class AetherTrainerMPS(AetherTrainerBase):
                         if restart_batch:
                             break
 
+                        backward_ok = True
                         if _pf.get("hazard", False):
                             try:
                                 self._ai.sanitize_gradients(self.model)
@@ -3926,10 +4460,9 @@ class AetherTrainerMPS(AetherTrainerBase):
                             if self.scaler is not None:
                                 self.scaler.update()
                         else:
-                            if self.scaler is not None:
-                                self.scaler.scale(loss).backward()
-                            else:
-                                loss.backward()
+                            backward_ok = self._backward_with_guard(loss, step)
+                        if not backward_ok:
+                            continue
                         # ANI-AI observe grads
                         try:
                             self._ai.observe_grads(self.model)
@@ -3938,9 +4471,11 @@ class AetherTrainerMPS(AetherTrainerBase):
                         self._zero_nonfinite_grads()
                         accum += 1
 
-                        ntok = int((suby != pad_id).sum().item())
-                        total_tok += ntok
-                        total_loss += float(loss_ce.detach().cpu().item()) * ntok
+                        tok_tensor = (suby != pad_id).sum().to(total_tok_tensor.dtype)
+                        total_tok_tensor = total_tok_tensor + tok_tensor
+                        total_loss_tensor = total_loss_tensor + loss_ce.detach().to(
+                            total_loss_tensor.dtype
+                        ) * tok_tensor
 
                         current_micro = max(1, int(self._micro_active))
                         if accum >= current_micro:
@@ -3956,11 +4491,7 @@ class AetherTrainerMPS(AetherTrainerBase):
                                     self.scaler.update()
                                 self.opt.zero_grad(set_to_none=True)
                             else:
-                                if self.scaler is not None:
-                                    self.scaler.step(self.opt)
-                                    self.scaler.update()
-                                else:
-                                    self.opt.step()
+                                self._optimizer_step_with_guard(step)
                                 self.opt.zero_grad(set_to_none=True)
                             # ANI-AI decide/act
                             try:
@@ -4004,11 +4535,7 @@ class AetherTrainerMPS(AetherTrainerBase):
                             self.scaler.update()
                         self.opt.zero_grad(set_to_none=True)
                     else:
-                        if self.scaler is not None:
-                            self.scaler.step(self.opt)
-                            self.scaler.update()
-                        else:
-                            self.opt.step()
+                        self._optimizer_step_with_guard(step)
                         self.opt.zero_grad(set_to_none=True)
                     # ANI-AI decide/act
                     try:
@@ -4038,6 +4565,8 @@ class AetherTrainerMPS(AetherTrainerBase):
                     except Exception:
                         pass
 
+                total_tok = int(total_tok_tensor.item())
+                total_loss = float(total_loss_tensor.item())
                 raw_loss_avg = total_loss / max(1, total_tok)
                 loss_avg = self._stabilize_loss_value(raw_loss_avg)
                 loss_avg = max(0.0, loss_avg)
@@ -4050,7 +4579,7 @@ class AetherTrainerMPS(AetherTrainerBase):
                 t0 = time.time()
                 tps = float(total_tok) / max(1e-6, elapsed)
                 ema_tps = self._tps_meter.update(total_tok, elapsed)
-                tps_stats = self._tps_meter.stats()
+                tps_stats_obj = self._tps_meter.stats(as_dict=False)
                 self._maybe_boost_throughput(ema_tps)
                 self._last_tok_per_sec = float(tps)
                 self._last_tok_per_sec_ema = float(ema_tps)
@@ -4068,6 +4597,9 @@ class AetherTrainerMPS(AetherTrainerBase):
                     if self._token_chunk > 0
                     else float(total_tok)
                 )
+
+                self._turbo_update(step, tps, ema_tps, tps_stats_obj, total_tok, chunk_hint)
+                tps_stats = tps_stats_obj.as_dict()
 
                 if self._adaptive_micro:
                     if self._micro_active > self._micro_base:
@@ -4095,7 +4627,11 @@ class AetherTrainerMPS(AetherTrainerBase):
                         pass
 
                         # --- K metrics: token-level buffers（pmax/correct/pred/true/lenbin + groups）
-                if self._k_enabled and _KBRIDGE_AVAILABLE:
+                if (
+                    self._k_enabled
+                    and _KBRIDGE_AVAILABLE
+                    and not getattr(self, "_turbo_disable_kbridge", False)
+                ):
                     try:
                         with torch.no_grad():
                             p = torch.softmax(logits.float(), dim=-1)
@@ -4197,8 +4733,16 @@ class AetherTrainerMPS(AetherTrainerBase):
                         pass
 
                 if step % self.cfg.log_every == 0:
+                    heavy_allowed = not getattr(
+                        self, "_turbo_metrics_suppressed", False
+                    )
                     # --- Temperature sweep ECE（current batch; snapshot only）
-                    if self._k_enabled and _KBRIDGE_AVAILABLE and self._kb_tsweep:
+                    if (
+                        heavy_allowed
+                        and self._k_enabled
+                        and _KBRIDGE_AVAILABLE
+                        and self._kb_tsweep
+                    ):
                         try:
                             with torch.no_grad():
                                 for Tval in self._kb_tsweep:
@@ -4298,7 +4842,8 @@ class AetherTrainerMPS(AetherTrainerBase):
 
                     # --- K-bridge: ECE + hist（overall）/ length-bucket / classwise（拡張）
                     if (
-                        self._k_enabled
+                        heavy_allowed
+                        and self._k_enabled
                         and _KBRIDGE_AVAILABLE
                         and (step % max(1, self._kb_metrics_every) == 0)
                         and self._kb_buf_pmax
@@ -4477,7 +5022,12 @@ class AetherTrainerMPS(AetherTrainerBase):
                             pass
 
                     # --- K-bridge: sequence-level NDCG@k (external hook provided)
-                    if self._k_enabled and _KBRIDGE_AVAILABLE and self._kb_seq_scores:
+                    if (
+                        heavy_allowed
+                        and self._k_enabled
+                        and _KBRIDGE_AVAILABLE
+                        and self._kb_seq_scores
+                    ):
                         try:
                             np_mod = _require_numpy("sequence-level NDCG evaluation")
 
@@ -4546,11 +5096,19 @@ class AetherTrainerMPS(AetherTrainerBase):
         return True
 
     def _zero_nonfinite_grads(self):
+        had_issue = False
         for p in self.model.parameters():
             if p.grad is None:
                 continue
-            if not torch.isfinite(p.grad).all():
-                p.grad.zero_()
+            finite = torch.isfinite(p.grad)
+            if finite.all():
+                continue
+            p.grad.zero_()
+            had_issue = True
+        if had_issue:
+            self._emit_nonfinite_event(
+                "grad", self._global_step, detail="gradients zeroed"
+            )
 
     @property
     def tok_per_sec(self) -> float:
@@ -4559,6 +5117,125 @@ class AetherTrainerMPS(AetherTrainerBase):
     @property
     def tok_per_sec_ema(self) -> float:
         return float(self._last_tok_per_sec_ema)
+
+    def _emit_nonfinite_event(self, where: str, step: int, detail: str = ""):
+        if self._nonfinite_event_verbose:
+            msg = f"[SAFE] non-finite sanitized at step={int(step)} ({where})"
+            if detail:
+                msg += f" :: {detail}"
+            print(msg)
+        evt = {"event": "nonfinite", "where": where, "step": int(step), "detail": detail}
+        bus = globals().get("_AETHER_EVENT_BUS")
+        if bus is not None:
+            try:
+                bus.emit(evt)
+            except Exception:
+                pass
+        else:
+            manager = getattr(self, "_ani_manager", None)
+            if manager is not None:
+                try:
+                    manager.on_nonfinite(evt)
+                except Exception:
+                    pass
+
+    def _sanitize_loss_value(self, value, name: str, step: int):
+        if not self._strict_loss_guard or value is None:
+            return value
+        if torch.is_tensor(value):
+            try:
+                finite = torch.isfinite(value)
+            except Exception:
+                return value
+            if finite.all():
+                return value
+            sanitized = torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
+            detail = ""
+            try:
+                detail = f"value={float(value.detach().cpu().item()):.4g}"
+            except Exception:
+                try:
+                    nf = int((~finite).sum().item())
+                    detail = f"nonfinite={nf}/{int(finite.numel())}"
+                except Exception:
+                    detail = "nonfinite"
+            self._emit_nonfinite_event(name, step, detail=detail)
+            return sanitized
+        if isinstance(value, (float, int)):
+            if math.isfinite(float(value)):
+                return value
+            self._emit_nonfinite_event(name, step, detail=f"value={value}")
+            return 0.0
+        return value
+
+    def _sanitize_tensor(self, tensor: torch.Tensor, name: str, step: int):
+        if tensor is None or not torch.is_tensor(tensor):
+            return tensor
+        try:
+            finite = torch.isfinite(tensor)
+        except Exception:
+            return tensor
+        if finite.all():
+            return tensor
+        sanitized = torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
+        detail = ""
+        try:
+            nf = int((~finite).sum().item())
+            detail = f"nonfinite={nf}/{int(finite.numel())}"
+        except Exception:
+            detail = "nonfinite"
+        self._emit_nonfinite_event(name, step, detail=detail)
+        return sanitized
+
+    def _is_numeric_error(self, err: BaseException) -> bool:
+        if err is None:
+            return False
+        msg = str(err).lower()
+        for key in ("nan", "inf", "overflow", "out of range", "invalid value"):
+            if key in msg:
+                return True
+        return False
+
+    def _backward_with_guard(self, loss: torch.Tensor, step: int) -> bool:
+        try:
+            if self.scaler is not None:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            return True
+        except RuntimeError as err:
+            if self._suppress_numeric_traceback and self._is_numeric_error(err):
+                self._emit_nonfinite_event("backward", step, detail=str(err))
+                try:
+                    self.opt.zero_grad(set_to_none=True)
+                except Exception:
+                    pass
+                if self.scaler is not None:
+                    try:
+                        self.scaler.update()
+                    except Exception:
+                        pass
+                return False
+            raise
+
+    def _optimizer_step_with_guard(self, step: int) -> bool:
+        try:
+            if self.scaler is not None:
+                self.scaler.step(self.opt)
+                self.scaler.update()
+            else:
+                self.opt.step()
+            return True
+        except RuntimeError as err:
+            if self._suppress_numeric_traceback and self._is_numeric_error(err):
+                self._emit_nonfinite_event("optimizer_step", step, detail=str(err))
+                if self.scaler is not None:
+                    try:
+                        self.scaler.update()
+                    except Exception:
+                        pass
+                return False
+            raise
 
 
 # ====== Lightning Fabric (optional placeholder) =============================
@@ -4840,6 +5517,18 @@ def __aether_main__():
     ap.add_argument("--no_prefetch_to_device", action="store_true")
     # model
     ap.add_argument("--vocab_size", type=int, default=32000)
+    ap.add_argument("--sp_model", type=str, default="", help="SentencePiece model path")
+    ap.add_argument(
+        "--tiktoken_encoding",
+        type=str,
+        default="",
+        help="Name of the TikToken encoding to blend (e.g. 'cl100k_base')",
+    )
+    ap.add_argument(
+        "--disable_byte_fallback",
+        action="store_true",
+        help="Disable byte-level fallback tokens in the hybrid tokenizer",
+    )
     ap.add_argument("--d_model", type=int, default=4096)
     ap.add_argument("--n_layers", type=int, default=32)
     ap.add_argument("--n_heads", type=int, default=32)
@@ -4866,6 +5555,14 @@ def __aether_main__():
     ap.add_argument("--window_size", type=int, default=0)
     ap.add_argument("--global_tokens", type=int, default=0)
     ap.add_argument("--global_stride", type=int, default=0)
+    # turbo governor
+    ap.add_argument("--turbo_target_tok", type=float, default=2000.0)
+    ap.add_argument("--turbo_window", type=int, default=6)
+    ap.add_argument("--turbo_cooldown", type=int, default=48)
+    ap.add_argument("--turbo_seq_floor", type=int, default=512)
+    ap.add_argument("--turbo_seq_step", type=int, default=256)
+    ap.add_argument("--turbo_disable_metrics_ratio", type=float, default=0.75)
+    ap.add_argument("--turbo_micro_floor", type=int, default=1)
     ap.add_argument("--mps_sync_every", type=int, default=0)
     ap.add_argument("--allow_mps_cpu_fallback", action="store_true")
     # optimizer
@@ -4989,7 +5686,17 @@ def __aether_main__():
 
     set_seed(1337)
 
-    tok = ByteTokenizer(vocab_size=args.vocab_size)
+    tok = ByteTokenizer(
+        vocab_size=args.vocab_size,
+        sp_model_path=args.sp_model or None,
+        tiktoken_encoding=args.tiktoken_encoding or None,
+        byte_fallback=not getattr(args, "disable_byte_fallback", False),
+    )
+    if tok.vocab_size != args.vocab_size:
+        print(
+            f"[TOK] adjusted vocab size from {args.vocab_size} to {tok.vocab_size} to accommodate hybrid ranges"
+        )
+        args.vocab_size = tok.vocab_size
     kvh = args.kv_heads if args.kv_heads and args.kv_heads > 0 else None
     model = AetherPumpSimple(
         vocab_size=args.vocab_size,
@@ -5083,6 +5790,13 @@ def __aether_main__():
         window_size=int(args.window_size),
         global_tokens=int(args.global_tokens),
         global_stride=int(args.global_stride),
+        turbo_target_tok=float(args.turbo_target_tok),
+        turbo_window=int(args.turbo_window),
+        turbo_cooldown=int(args.turbo_cooldown),
+        turbo_seq_floor=int(args.turbo_seq_floor),
+        turbo_seq_step=int(args.turbo_seq_step),
+        turbo_disable_metrics_ratio=float(args.turbo_disable_metrics_ratio),
+        turbo_micro_floor=int(args.turbo_micro_floor),
         opt_cpu8bit=bool(args.opt_cpu8bit),
         opt_galore=bool(args.opt_galore),
         galore_rank=int(args.galore_rank),
