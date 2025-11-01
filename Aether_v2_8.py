@@ -3138,6 +3138,17 @@ class AetherTrainerBase:
 
         wd = 0.01
 
+        self._strict_loss_guard = os.environ.get("AETHER_STRICT_LOSS_GUARD", "1") != "0"
+        self._strict_activation_guard = (
+            os.environ.get("AETHER_STRICT_ACT_GUARD", "0") != "0"
+        )
+        self._suppress_numeric_traceback = (
+            os.environ.get("AETHER_SUPPRESS_NUMERIC_TRACEBACK", "1") != "0"
+        )
+        self._nonfinite_event_verbose = (
+            os.environ.get("AETHER_NONFINITE_VERBOSE", "1") != "0"
+        )
+
         # ultramem optimizer factory (if autopatch installed)
         if (up is not None) and hasattr(self.model, "_ultramem_make_optimizer"):
             self.opt = self.model._ultramem_make_optimizer(lr=self.cfg.lr, wd=wd)
@@ -3810,6 +3821,16 @@ class AetherTrainerMPS(AetherTrainerBase):
                                 device_type="mps", dtype=self.amp_dtype
                             ):
                                 logits, lvi_logs = self._compute_logits(subx)
+                                if self._strict_activation_guard:
+                                    logits = self._sanitize_tensor(
+                                        logits, "forward.logits", step
+                                    )
+                                if isinstance(lvi_logs, dict):
+                                    for _lk in ("mv_reg", "two_view"):
+                                        if _lk in lvi_logs:
+                                            lvi_logs[_lk] = self._sanitize_loss_value(
+                                                lvi_logs[_lk], f"lvi.{_lk}", step
+                                            )
                                 _pf = {}
                                 try:
                                     _pf = self._ai.post_forward_assess(
@@ -3820,6 +3841,9 @@ class AetherTrainerMPS(AetherTrainerBase):
                             # ★ CE は常に FP32・autocast 無効で計算（数値安定のため）
                             with torch.autocast(device_type="mps", enabled=False):
                                 loss_ce = self._ce_loss(logits, suby, pad_id)
+                                loss_ce = self._sanitize_loss_value(
+                                    loss_ce, "loss_ce", step
+                                )
                                 loss = (
                                     loss_ce
                                     + float(self.cfg.lvi_mv_weight) * lvi_logs["mv_reg"]
@@ -3853,9 +3877,11 @@ class AetherTrainerMPS(AetherTrainerBase):
                                             t_pos = self._teacher(subx).to(
                                                 E_bar.device, dtype=E_bar.dtype
                                             )
-                                        loss = loss + float(self._k_reg_w) * khuber_loss(
-                                            E_bar, t_pos, delta=1.0
+                                        reg = khuber_loss(E_bar, t_pos, delta=1.0)
+                                        reg = self._sanitize_loss_value(
+                                            reg, "kbridge", step
                                         )
+                                        loss = loss + float(self._k_reg_w) * reg
                                     except Exception:
                                         pass
 
@@ -3893,6 +3919,9 @@ class AetherTrainerMPS(AetherTrainerBase):
                                                         )
                                                     ),
                                                 )
+                                                loss_int = self._sanitize_loss_value(
+                                                    loss_int, "intent_loss", step
+                                                )
                                                 loss = (
                                                     loss
                                                     + float(self.cfg.intent_weight)
@@ -3901,7 +3930,11 @@ class AetherTrainerMPS(AetherTrainerBase):
                                         except Exception:
                                             pass
 
+                                loss = self._sanitize_loss_value(loss, "loss", step)
                                 loss = loss / max(1, current_micro)
+                                loss = self._sanitize_loss_value(
+                                    loss, "loss_scaled", step
+                                )
                         except RuntimeError as e:
                             if self._maybe_handle_oom(e, B):
                                 restart_batch = True
@@ -3917,6 +3950,7 @@ class AetherTrainerMPS(AetherTrainerBase):
                         if restart_batch:
                             break
 
+                        backward_ok = True
                         if _pf.get("hazard", False):
                             try:
                                 self._ai.sanitize_gradients(self.model)
@@ -3926,10 +3960,9 @@ class AetherTrainerMPS(AetherTrainerBase):
                             if self.scaler is not None:
                                 self.scaler.update()
                         else:
-                            if self.scaler is not None:
-                                self.scaler.scale(loss).backward()
-                            else:
-                                loss.backward()
+                            backward_ok = self._backward_with_guard(loss, step)
+                        if not backward_ok:
+                            continue
                         # ANI-AI observe grads
                         try:
                             self._ai.observe_grads(self.model)
@@ -3956,11 +3989,7 @@ class AetherTrainerMPS(AetherTrainerBase):
                                     self.scaler.update()
                                 self.opt.zero_grad(set_to_none=True)
                             else:
-                                if self.scaler is not None:
-                                    self.scaler.step(self.opt)
-                                    self.scaler.update()
-                                else:
-                                    self.opt.step()
+                                self._optimizer_step_with_guard(step)
                                 self.opt.zero_grad(set_to_none=True)
                             # ANI-AI decide/act
                             try:
@@ -4004,11 +4033,7 @@ class AetherTrainerMPS(AetherTrainerBase):
                             self.scaler.update()
                         self.opt.zero_grad(set_to_none=True)
                     else:
-                        if self.scaler is not None:
-                            self.scaler.step(self.opt)
-                            self.scaler.update()
-                        else:
-                            self.opt.step()
+                        self._optimizer_step_with_guard(step)
                         self.opt.zero_grad(set_to_none=True)
                     # ANI-AI decide/act
                     try:
@@ -4546,11 +4571,19 @@ class AetherTrainerMPS(AetherTrainerBase):
         return True
 
     def _zero_nonfinite_grads(self):
+        had_issue = False
         for p in self.model.parameters():
             if p.grad is None:
                 continue
-            if not torch.isfinite(p.grad).all():
-                p.grad.zero_()
+            finite = torch.isfinite(p.grad)
+            if finite.all():
+                continue
+            p.grad.zero_()
+            had_issue = True
+        if had_issue:
+            self._emit_nonfinite_event(
+                "grad", self._global_step, detail="gradients zeroed"
+            )
 
     @property
     def tok_per_sec(self) -> float:
@@ -4559,6 +4592,125 @@ class AetherTrainerMPS(AetherTrainerBase):
     @property
     def tok_per_sec_ema(self) -> float:
         return float(self._last_tok_per_sec_ema)
+
+    def _emit_nonfinite_event(self, where: str, step: int, detail: str = ""):
+        if self._nonfinite_event_verbose:
+            msg = f"[SAFE] non-finite sanitized at step={int(step)} ({where})"
+            if detail:
+                msg += f" :: {detail}"
+            print(msg)
+        evt = {"event": "nonfinite", "where": where, "step": int(step), "detail": detail}
+        bus = globals().get("_AETHER_EVENT_BUS")
+        if bus is not None:
+            try:
+                bus.emit(evt)
+            except Exception:
+                pass
+        else:
+            manager = getattr(self, "_ani_manager", None)
+            if manager is not None:
+                try:
+                    manager.on_nonfinite(evt)
+                except Exception:
+                    pass
+
+    def _sanitize_loss_value(self, value, name: str, step: int):
+        if not self._strict_loss_guard or value is None:
+            return value
+        if torch.is_tensor(value):
+            try:
+                finite = torch.isfinite(value)
+            except Exception:
+                return value
+            if finite.all():
+                return value
+            sanitized = torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
+            detail = ""
+            try:
+                detail = f"value={float(value.detach().cpu().item()):.4g}"
+            except Exception:
+                try:
+                    nf = int((~finite).sum().item())
+                    detail = f"nonfinite={nf}/{int(finite.numel())}"
+                except Exception:
+                    detail = "nonfinite"
+            self._emit_nonfinite_event(name, step, detail=detail)
+            return sanitized
+        if isinstance(value, (float, int)):
+            if math.isfinite(float(value)):
+                return value
+            self._emit_nonfinite_event(name, step, detail=f"value={value}")
+            return 0.0
+        return value
+
+    def _sanitize_tensor(self, tensor: torch.Tensor, name: str, step: int):
+        if tensor is None or not torch.is_tensor(tensor):
+            return tensor
+        try:
+            finite = torch.isfinite(tensor)
+        except Exception:
+            return tensor
+        if finite.all():
+            return tensor
+        sanitized = torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
+        detail = ""
+        try:
+            nf = int((~finite).sum().item())
+            detail = f"nonfinite={nf}/{int(finite.numel())}"
+        except Exception:
+            detail = "nonfinite"
+        self._emit_nonfinite_event(name, step, detail=detail)
+        return sanitized
+
+    def _is_numeric_error(self, err: BaseException) -> bool:
+        if err is None:
+            return False
+        msg = str(err).lower()
+        for key in ("nan", "inf", "overflow", "out of range", "invalid value"):
+            if key in msg:
+                return True
+        return False
+
+    def _backward_with_guard(self, loss: torch.Tensor, step: int) -> bool:
+        try:
+            if self.scaler is not None:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            return True
+        except RuntimeError as err:
+            if self._suppress_numeric_traceback and self._is_numeric_error(err):
+                self._emit_nonfinite_event("backward", step, detail=str(err))
+                try:
+                    self.opt.zero_grad(set_to_none=True)
+                except Exception:
+                    pass
+                if self.scaler is not None:
+                    try:
+                        self.scaler.update()
+                    except Exception:
+                        pass
+                return False
+            raise
+
+    def _optimizer_step_with_guard(self, step: int) -> bool:
+        try:
+            if self.scaler is not None:
+                self.scaler.step(self.opt)
+                self.scaler.update()
+            else:
+                self.opt.step()
+            return True
+        except RuntimeError as err:
+            if self._suppress_numeric_traceback and self._is_numeric_error(err):
+                self._emit_nonfinite_event("optimizer_step", step, detail=str(err))
+                if self.scaler is not None:
+                    try:
+                        self.scaler.update()
+                    except Exception:
+                        pass
+                return False
+            raise
 
 
 # ====== Lightning Fabric (optional placeholder) =============================
