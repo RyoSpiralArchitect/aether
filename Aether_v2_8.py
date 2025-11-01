@@ -450,6 +450,16 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
 
 from torch.amp import GradScaler
 
+try:  # SentencePiece is optional; tokenizer gracefully degrades without it
+    import sentencepiece as _sentencepiece
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    _sentencepiece = None
+
+try:  # TikToken-style encodings are optional as well
+    import tiktoken as _tiktoken
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    _tiktoken = None
+
 
 def _aether_detect_mps() -> bool:
     try:
@@ -1206,12 +1216,25 @@ except Exception:
     _KBRIDGE_AVAILABLE = False
 
 
+# Track tokenizer layout so analytics can adapt to hybrid vocabularies
+_AETHER_TOKENIZER_LAYOUT: Dict[str, Any] = {
+    "byte_base": 3,
+    "byte_count": 256,
+    "sp_base": None,
+    "sp_size": 0,
+    "tt_base": None,
+    "tt_size": 0,
+}
+
+
 # === Class grouping helpers (ByteTokenizer-aware; fallback-safe) =============
 def _build_classmap(vocab_size: int, scheme: str = "byte-basic", json_path: str = ""):
     """
     Returns: (classmap_np[int32, shape=(vocab_size,)], group_names[list[str]])
     scheme: "byte-basic" | "byte-compact" | "custom-json"
-    - ByteTokenizer: PAD=0, BOS=1, EOS=2, bytes: id=3..258 => b=0..255
+    - ByteTokenizer hybrid: PAD=0, BOS=1, EOS=2, optional SentencePiece/TikToken
+      ranges, and (if enabled) byte fallback tokens. Byte ranges are detected via
+      _AETHER_TOKENIZER_LAYOUT.
     Groups (byte-basic):
       0=control(<32,127 except whitespace), 1=whitespace, 2=digit, 3=alpha,
       4=punct, 5=ascii-other, 6=non-ascii(>=128), 7=special(PAD/BOS/EOS/others)
@@ -1253,24 +1276,33 @@ def _build_classmap(vocab_size: int, scheme: str = "byte-basic", json_path: str 
                 return m, names
         except Exception:
             pass
-    # byte-based
-    for tid in range(3, min(vocab_size, 259)):
-        b = tid - 3
-        if b < 32 or b == 127:  # control
-            if b in (9, 10, 11, 12, 13):
+    layout = _AETHER_TOKENIZER_LAYOUT or {}
+    byte_base = layout.get("byte_base", 3)
+    byte_count = layout.get("byte_count", 256)
+    if not isinstance(byte_base, int):
+        byte_base = 3
+    if not isinstance(byte_count, int):
+        byte_count = 256
+    byte_count = max(0, min(byte_count, max(0, vocab_size - byte_base)))
+    if byte_count and byte_base < vocab_size:
+        end = min(vocab_size, byte_base + byte_count)
+        for tid in range(byte_base, end):
+            b = tid - byte_base
+            if b < 32 or b == 127:  # control
+                if b in (9, 10, 11, 12, 13):
+                    m[tid] = 1  # whitespace
+                else:
+                    m[tid] = 0
+            elif b == 32 or b in (9, 10, 11, 12, 13):
                 m[tid] = 1  # whitespace
+            elif 48 <= b <= 57:
+                m[tid] = 2  # digit
+            elif 65 <= b <= 90 or 97 <= b <= 122:
+                m[tid] = 3  # alpha
+            elif b <= 127:
+                m[tid] = 4 if chr(b) in string.punctuation else 5
             else:
-                m[tid] = 0
-        elif b == 32 or b in (9, 10, 11, 12, 13):
-            m[tid] = 1  # whitespace
-        elif 48 <= b <= 57:
-            m[tid] = 2  # digit
-        elif 65 <= b <= 90 or 97 <= b <= 122:
-            m[tid] = 3  # alpha
-        elif b <= 127:
-            m[tid] = 4 if chr(b) in string.punctuation else 5
-        else:
-            m[tid] = 6  # non-ASCII
+                m[tid] = 6  # non-ASCII
     if scheme == "byte-compact":
         # merge some buckets: asciiOther->punct, control->whitespace
         m[np_mod.where(m == 5)] = 4
@@ -1775,20 +1807,245 @@ def convert_linear_to_int8_lora(
 
 # ====== Tokenizer (Byte-level; PAD/BOS/EOS) ==================================
 class ByteTokenizer:
+    """Hybrid tokenizer that blends byte, SentencePiece, and TikToken encodings.
+
+    The legacy byte-level behaviour is preserved as a fallback, while optional
+    SentencePiece and TikToken vocabularies can be layered on top when the
+    corresponding libraries/models are available. At runtime the tokenizer picks
+    whichever sub-tokenization yields the fewest tokens for a given fragment,
+    enabling compact yet expressive sequences without sacrificing robustness.
+    """
+
     PAD = 0
     BOS = 1
     EOS = 2
 
-    def __init__(self, vocab_size=32000):
-        self.vocab_size = vocab_size
+    def __init__(
+        self,
+        vocab_size: int = 32000,
+        sp_model_path: Optional[str] = None,
+        sp_model_proto: Optional[bytes] = None,
+        tiktoken_encoding: Optional[str] = None,
+        byte_fallback: bool = True,
+    ):
+        self._sp = None
+        self._sp_vocab = 0
+        self._tt = None
+        self._tt_vocab = 0
+        self._byte_fallback = bool(byte_fallback)
 
+        info_bits: List[str] = []
+
+        if _sentencepiece is not None and (sp_model_path or sp_model_proto):
+            proc = _sentencepiece.SentencePieceProcessor()
+            try:
+                if sp_model_proto is not None:
+                    proc.LoadFromSerializedProto(sp_model_proto)
+                elif sp_model_path is not None:
+                    proc.Load(sp_model_path)
+                self._sp_vocab = int(proc.get_piece_size())
+                if self._sp_vocab > 0:
+                    self._sp = proc
+                    info_bits.append(f"sentencepiece={self._sp_vocab}")
+                else:
+                    print("[TOK] SentencePiece model has no vocabulary; disabling")
+            except Exception as exc:
+                print(f"[TOK] Failed to load SentencePiece model: {exc}")
+        elif sp_model_path and _sentencepiece is None:
+            print(
+                f"[TOK] sentencepiece package is unavailable; requested model {sp_model_path!r} ignored"
+            )
+
+        if tiktoken_encoding and _tiktoken is not None:
+            try:
+                enc = _tiktoken.get_encoding(tiktoken_encoding)
+                vocab = int(getattr(enc, "n_vocab", 0))
+                if vocab > 0:
+                    self._tt = enc
+                    self._tt_vocab = vocab
+                    info_bits.append(f"tiktoken={tiktoken_encoding}:{vocab}")
+                else:
+                    print(
+                        f"[TOK] TikToken encoding {tiktoken_encoding!r} has zero vocab; disabling"
+                    )
+            except Exception as exc:
+                print(f"[TOK] Failed to load TikToken encoding {tiktoken_encoding!r}: {exc}")
+        elif tiktoken_encoding and _tiktoken is None:
+            print(
+                f"[TOK] tiktoken package is unavailable; requested encoding {tiktoken_encoding!r} ignored"
+            )
+
+        self._sp_base = self.EOS + 1
+        offset = self._sp_base
+        if self._sp is not None and self._sp_vocab > 0:
+            self._sp_base = offset
+            offset += self._sp_vocab
+        else:
+            self._sp_base = offset
+
+        self._tt_base = offset
+        if self._tt is not None and self._tt_vocab > 0:
+            self._tt_base = offset
+            offset += self._tt_vocab
+
+        self._byte_base = offset
+        if self._byte_fallback:
+            offset += 256
+            info_bits.append("byte-fallback")
+        else:
+            info_bits.append("no-byte-fallback")
+
+        self._total_vocab = offset
+        self.vocab_size = max(int(vocab_size), self._total_vocab)
+        if self.vocab_size > self._total_vocab:
+            info_bits.append(f"pad={self.vocab_size - self._total_vocab}")
+
+        if not info_bits:
+            info_bits.append("pure-byte")
+
+        global _AETHER_TOKENIZER_LAYOUT
+        _AETHER_TOKENIZER_LAYOUT = {
+            "byte_base": self._byte_base if self._byte_fallback else None,
+            "byte_count": 256 if self._byte_fallback else 0,
+            "sp_base": self._sp_base if self._sp is not None else None,
+            "sp_size": self._sp_vocab if self._sp is not None else 0,
+            "tt_base": self._tt_base if self._tt is not None else None,
+            "tt_size": self._tt_vocab if self._tt is not None else 0,
+        }
+
+        print(
+            f"[TOK] Hybrid tokenizer ready ({', '.join(info_bits)}) → vocab={self.vocab_size}"
+        )
+
+    # ------------------------------------------------------------------ helpers
+    def _encode_bytes(self, segment: str) -> List[int]:
+        if not self._byte_fallback:
+            return []
+        data = segment.encode("utf-8", errors="ignore")
+        if not data:
+            return []
+        return [self._byte_base + int(b) for b in data]
+
+    def _sp_piece_to_id(self, piece: str) -> Optional[int]:
+        if self._sp is None:
+            return None
+        try:
+            pid = int(self._sp.piece_to_id(piece))
+        except Exception:
+            return None
+        return pid if pid >= 0 else None
+
+    # ---------------------------------------------------------------- interface
     def encode(self, s: str) -> List[int]:
-        b = s.encode("utf-8", errors="ignore")[: self.vocab_size - 3]
-        return [self.BOS] + [int(x) + 3 for x in b] + [self.EOS]
+        if not isinstance(s, str):
+            s = str(s)
+
+        tokens: List[int] = [self.BOS]
+        segments: List[str]
+        if self._sp is not None:
+            try:
+                segments = self._sp.encode(s, out_type=str)
+            except Exception:
+                segments = [s]
+        else:
+            segments = [s]
+
+        for seg in segments:
+            best: Optional[List[int]] = None
+
+            if self._sp is not None:
+                pid = self._sp_piece_to_id(seg)
+                if pid is not None and 0 <= pid < self._sp_vocab:
+                    best = [self._sp_base + pid]
+
+            if self._tt is not None:
+                try:
+                    tt_raw = self._tt.encode(seg)
+                except Exception:
+                    tt_raw = []
+                tt_ids = [self._tt_base + int(tid) for tid in tt_raw if tid < self._tt_vocab]
+                if tt_ids and (best is None or len(tt_ids) < len(best)):
+                    best = tt_ids
+
+            if not best:
+                best = self._encode_bytes(seg)
+
+            if not best:
+                # Absolute fallback: character-wise (may still be empty for whitespace)
+                for ch in seg:
+                    ch_ids = self._encode_bytes(ch)
+                    if ch_ids:
+                        tokens.extend(ch_ids)
+                continue
+
+            tokens.extend(best)
+
+        tokens.append(self.EOS)
+        return tokens
 
     def decode(self, ids: List[int]) -> str:
-        b = [max(0, min(255, i - 3)) for i in ids if i >= 3]
-        return bytes(b).decode("utf-8", errors="ignore")
+        pieces: List[str] = []
+
+        sp_buffer: List[int] = []
+        tt_buffer: List[int] = []
+
+        def _flush_sp():
+            if not sp_buffer or self._sp is None:
+                sp_buffer.clear()
+                return
+            try:
+                pieces.append(self._sp.decode_ids(sp_buffer))
+            except Exception:
+                for pid in sp_buffer:
+                    try:
+                        pieces.append(self._sp.id_to_piece(pid))
+                    except Exception:
+                        continue
+            finally:
+                sp_buffer.clear()
+
+        def _flush_tt():
+            if not tt_buffer or self._tt is None:
+                tt_buffer.clear()
+                return
+            try:
+                pieces.append(self._tt.decode(tt_buffer))
+            except Exception:
+                for tid in tt_buffer:
+                    try:
+                        pieces.append(self._tt.decode([tid]))
+                    except Exception:
+                        continue
+            finally:
+                tt_buffer.clear()
+
+        for tid in ids:
+            if tid in (self.PAD, self.BOS, self.EOS):
+                continue
+            if self._sp is not None and self._sp_base <= tid < self._sp_base + self._sp_vocab:
+                _flush_tt()
+                sp_buffer.append(int(tid - self._sp_base))
+                continue
+            if self._tt is not None and self._tt_base <= tid < self._tt_base + self._tt_vocab:
+                _flush_sp()
+                tt_buffer.append(int(tid - self._tt_base))
+                continue
+
+            _flush_sp()
+            _flush_tt()
+
+            if self._byte_fallback and self._byte_base <= tid < self._byte_base + 256:
+                pieces.append(
+                    bytes([int(tid - self._byte_base)]).decode("utf-8", errors="ignore")
+                )
+
+        _flush_sp()
+        _flush_tt()
+
+        text = "".join(pieces)
+        if self._sp is not None:
+            text = text.replace("\u2581", " ")
+        return text
 
 
 # ====== RMSNorm / SwiGLU / Rotary ===========================================
@@ -4992,6 +5249,18 @@ def __aether_main__():
     ap.add_argument("--no_prefetch_to_device", action="store_true")
     # model
     ap.add_argument("--vocab_size", type=int, default=32000)
+    ap.add_argument("--sp_model", type=str, default="", help="SentencePiece model path")
+    ap.add_argument(
+        "--tiktoken_encoding",
+        type=str,
+        default="",
+        help="Name of the TikToken encoding to blend (e.g. 'cl100k_base')",
+    )
+    ap.add_argument(
+        "--disable_byte_fallback",
+        action="store_true",
+        help="Disable byte-level fallback tokens in the hybrid tokenizer",
+    )
     ap.add_argument("--d_model", type=int, default=4096)
     ap.add_argument("--n_layers", type=int, default=32)
     ap.add_argument("--n_heads", type=int, default=32)
@@ -5141,7 +5410,17 @@ def __aether_main__():
 
     set_seed(1337)
 
-    tok = ByteTokenizer(vocab_size=args.vocab_size)
+    tok = ByteTokenizer(
+        vocab_size=args.vocab_size,
+        sp_model_path=args.sp_model or None,
+        tiktoken_encoding=args.tiktoken_encoding or None,
+        byte_fallback=not getattr(args, "disable_byte_fallback", False),
+    )
+    if tok.vocab_size != args.vocab_size:
+        print(
+            f"[TOK] adjusted vocab size from {args.vocab_size} to {tok.vocab_size} to accommodate hybrid ranges"
+        )
+        args.vocab_size = tok.vocab_size
     kvh = args.kv_heads if args.kv_heads and args.kv_heads > 0 else None
     model = AetherPumpSimple(
         vocab_size=args.vocab_size,
