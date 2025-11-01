@@ -206,17 +206,50 @@ def _aether_mps_warmup():
                     print(f"[MPS] attention warmup skipped: {e}")
 
         total_elapsed = matmul_elapsed + attn_elapsed
+        matmul_flop = 2.0 * float(size) * float(size) * float(size) * float(steps)
+        matmul_gflops = matmul_flop / max(matmul_elapsed, 1e-9) / 1e9
+        telemetry = {
+            "device": "mps",
+            "dtype": dtype_name,
+            "matmul": {
+                "size": size,
+                "steps": steps,
+                "elapsed_s": matmul_elapsed,
+                "total_flop": matmul_flop,
+                "gflops_per_s": matmul_gflops,
+            },
+        }
         msg = (
             f"[MPS] warmup pumped {steps}x matmul (size={size}, dtype={dtype_name}) "
-            f"in {matmul_elapsed:.3f}s"
+            f"in {matmul_elapsed:.3f}s (~{matmul_gflops:,.1f} GFLOP/s)"
         )
         if attn_enable and attn_elapsed > 0.0:
+            telemetry["attention"] = {
+                "steps": attn_steps,
+                "heads": attn_heads,
+                "seq": attn_seq,
+                "head_dim": attn_dim,
+                "elapsed_s": attn_elapsed,
+                "tokens_per_s": attn_tok_per_sec,
+            }
             msg += (
                 f"; attention warmup {attn_steps}x (seq={attn_seq}, heads={attn_heads}, "
                 f"dim={attn_dim}) in {attn_elapsed:.3f}s (~{attn_tok_per_sec:,.0f} tok/s)"
             )
         msg += f" [total {total_elapsed:.3f}s]"
         print(msg)
+        export_path = _aos.environ.get("AETHER_MPS_WARMUP_EXPORT")
+        if export_path:
+            try:
+                import json as _json
+
+                with open(export_path, "w", encoding="utf-8") as _fh:
+                    _json.dump(telemetry, _fh, indent=2, sort_keys=True)
+                print(f"[MPS] warmup telemetry exported to {export_path!r}")
+            except Exception as e:
+                print(
+                    f"[MPS] failed to export telemetry to {export_path!r}: {e}"
+                )
     except Exception as e:
         print(f"[MPS] warmup failed: {e}")
 
@@ -384,8 +417,9 @@ import glob
 import threading
 import random
 import types
+import argparse
 from dataclasses import dataclass, field
-from typing import Optional, List, Tuple, Dict, Any, Deque
+from typing import Optional, List, Tuple, Dict, Any, Union, Deque
 from collections import deque
 
 try:
@@ -415,6 +449,16 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
     ) from exc
 
 from torch.amp import GradScaler
+
+try:  # SentencePiece is optional; tokenizer gracefully degrades without it
+    import sentencepiece as _sentencepiece
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    _sentencepiece = None
+
+try:  # TikToken-style encodings are optional as well
+    import tiktoken as _tiktoken
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    _tiktoken = None
 
 
 def _aether_detect_mps() -> bool:
@@ -1172,12 +1216,25 @@ except Exception:
     _KBRIDGE_AVAILABLE = False
 
 
+# Track tokenizer layout so analytics can adapt to hybrid vocabularies
+_AETHER_TOKENIZER_LAYOUT: Dict[str, Any] = {
+    "byte_base": 3,
+    "byte_count": 256,
+    "sp_base": None,
+    "sp_size": 0,
+    "tt_base": None,
+    "tt_size": 0,
+}
+
+
 # === Class grouping helpers (ByteTokenizer-aware; fallback-safe) =============
 def _build_classmap(vocab_size: int, scheme: str = "byte-basic", json_path: str = ""):
     """
     Returns: (classmap_np[int32, shape=(vocab_size,)], group_names[list[str]])
     scheme: "byte-basic" | "byte-compact" | "custom-json"
-    - ByteTokenizer: PAD=0, BOS=1, EOS=2, bytes: id=3..258 => b=0..255
+    - ByteTokenizer hybrid: PAD=0, BOS=1, EOS=2, optional SentencePiece/TikToken
+      ranges, and (if enabled) byte fallback tokens. Byte ranges are detected via
+      _AETHER_TOKENIZER_LAYOUT.
     Groups (byte-basic):
       0=control(<32,127 except whitespace), 1=whitespace, 2=digit, 3=alpha,
       4=punct, 5=ascii-other, 6=non-ascii(>=128), 7=special(PAD/BOS/EOS/others)
@@ -1219,24 +1276,33 @@ def _build_classmap(vocab_size: int, scheme: str = "byte-basic", json_path: str 
                 return m, names
         except Exception:
             pass
-    # byte-based
-    for tid in range(3, min(vocab_size, 259)):
-        b = tid - 3
-        if b < 32 or b == 127:  # control
-            if b in (9, 10, 11, 12, 13):
+    layout = _AETHER_TOKENIZER_LAYOUT or {}
+    byte_base = layout.get("byte_base", 3)
+    byte_count = layout.get("byte_count", 256)
+    if not isinstance(byte_base, int):
+        byte_base = 3
+    if not isinstance(byte_count, int):
+        byte_count = 256
+    byte_count = max(0, min(byte_count, max(0, vocab_size - byte_base)))
+    if byte_count and byte_base < vocab_size:
+        end = min(vocab_size, byte_base + byte_count)
+        for tid in range(byte_base, end):
+            b = tid - byte_base
+            if b < 32 or b == 127:  # control
+                if b in (9, 10, 11, 12, 13):
+                    m[tid] = 1  # whitespace
+                else:
+                    m[tid] = 0
+            elif b == 32 or b in (9, 10, 11, 12, 13):
                 m[tid] = 1  # whitespace
+            elif 48 <= b <= 57:
+                m[tid] = 2  # digit
+            elif 65 <= b <= 90 or 97 <= b <= 122:
+                m[tid] = 3  # alpha
+            elif b <= 127:
+                m[tid] = 4 if chr(b) in string.punctuation else 5
             else:
-                m[tid] = 0
-        elif b == 32 or b in (9, 10, 11, 12, 13):
-            m[tid] = 1  # whitespace
-        elif 48 <= b <= 57:
-            m[tid] = 2  # digit
-        elif 65 <= b <= 90 or 97 <= b <= 122:
-            m[tid] = 3  # alpha
-        elif b <= 127:
-            m[tid] = 4 if chr(b) in string.punctuation else 5
-        else:
-            m[tid] = 6  # non-ASCII
+                m[tid] = 6  # non-ASCII
     if scheme == "byte-compact":
         # merge some buckets: asciiOther->punct, control->whitespace
         m[np_mod.where(m == 5)] = 4
@@ -1741,20 +1807,245 @@ def convert_linear_to_int8_lora(
 
 # ====== Tokenizer (Byte-level; PAD/BOS/EOS) ==================================
 class ByteTokenizer:
+    """Hybrid tokenizer that blends byte, SentencePiece, and TikToken encodings.
+
+    The legacy byte-level behaviour is preserved as a fallback, while optional
+    SentencePiece and TikToken vocabularies can be layered on top when the
+    corresponding libraries/models are available. At runtime the tokenizer picks
+    whichever sub-tokenization yields the fewest tokens for a given fragment,
+    enabling compact yet expressive sequences without sacrificing robustness.
+    """
+
     PAD = 0
     BOS = 1
     EOS = 2
 
-    def __init__(self, vocab_size=32000):
-        self.vocab_size = vocab_size
+    def __init__(
+        self,
+        vocab_size: int = 32000,
+        sp_model_path: Optional[str] = None,
+        sp_model_proto: Optional[bytes] = None,
+        tiktoken_encoding: Optional[str] = None,
+        byte_fallback: bool = True,
+    ):
+        self._sp = None
+        self._sp_vocab = 0
+        self._tt = None
+        self._tt_vocab = 0
+        self._byte_fallback = bool(byte_fallback)
 
+        info_bits: List[str] = []
+
+        if _sentencepiece is not None and (sp_model_path or sp_model_proto):
+            proc = _sentencepiece.SentencePieceProcessor()
+            try:
+                if sp_model_proto is not None:
+                    proc.LoadFromSerializedProto(sp_model_proto)
+                elif sp_model_path is not None:
+                    proc.Load(sp_model_path)
+                self._sp_vocab = int(proc.get_piece_size())
+                if self._sp_vocab > 0:
+                    self._sp = proc
+                    info_bits.append(f"sentencepiece={self._sp_vocab}")
+                else:
+                    print("[TOK] SentencePiece model has no vocabulary; disabling")
+            except Exception as exc:
+                print(f"[TOK] Failed to load SentencePiece model: {exc}")
+        elif sp_model_path and _sentencepiece is None:
+            print(
+                f"[TOK] sentencepiece package is unavailable; requested model {sp_model_path!r} ignored"
+            )
+
+        if tiktoken_encoding and _tiktoken is not None:
+            try:
+                enc = _tiktoken.get_encoding(tiktoken_encoding)
+                vocab = int(getattr(enc, "n_vocab", 0))
+                if vocab > 0:
+                    self._tt = enc
+                    self._tt_vocab = vocab
+                    info_bits.append(f"tiktoken={tiktoken_encoding}:{vocab}")
+                else:
+                    print(
+                        f"[TOK] TikToken encoding {tiktoken_encoding!r} has zero vocab; disabling"
+                    )
+            except Exception as exc:
+                print(f"[TOK] Failed to load TikToken encoding {tiktoken_encoding!r}: {exc}")
+        elif tiktoken_encoding and _tiktoken is None:
+            print(
+                f"[TOK] tiktoken package is unavailable; requested encoding {tiktoken_encoding!r} ignored"
+            )
+
+        self._sp_base = self.EOS + 1
+        offset = self._sp_base
+        if self._sp is not None and self._sp_vocab > 0:
+            self._sp_base = offset
+            offset += self._sp_vocab
+        else:
+            self._sp_base = offset
+
+        self._tt_base = offset
+        if self._tt is not None and self._tt_vocab > 0:
+            self._tt_base = offset
+            offset += self._tt_vocab
+
+        self._byte_base = offset
+        if self._byte_fallback:
+            offset += 256
+            info_bits.append("byte-fallback")
+        else:
+            info_bits.append("no-byte-fallback")
+
+        self._total_vocab = offset
+        self.vocab_size = max(int(vocab_size), self._total_vocab)
+        if self.vocab_size > self._total_vocab:
+            info_bits.append(f"pad={self.vocab_size - self._total_vocab}")
+
+        if not info_bits:
+            info_bits.append("pure-byte")
+
+        global _AETHER_TOKENIZER_LAYOUT
+        _AETHER_TOKENIZER_LAYOUT = {
+            "byte_base": self._byte_base if self._byte_fallback else None,
+            "byte_count": 256 if self._byte_fallback else 0,
+            "sp_base": self._sp_base if self._sp is not None else None,
+            "sp_size": self._sp_vocab if self._sp is not None else 0,
+            "tt_base": self._tt_base if self._tt is not None else None,
+            "tt_size": self._tt_vocab if self._tt is not None else 0,
+        }
+
+        print(
+            f"[TOK] Hybrid tokenizer ready ({', '.join(info_bits)}) → vocab={self.vocab_size}"
+        )
+
+    # ------------------------------------------------------------------ helpers
+    def _encode_bytes(self, segment: str) -> List[int]:
+        if not self._byte_fallback:
+            return []
+        data = segment.encode("utf-8", errors="ignore")
+        if not data:
+            return []
+        return [self._byte_base + int(b) for b in data]
+
+    def _sp_piece_to_id(self, piece: str) -> Optional[int]:
+        if self._sp is None:
+            return None
+        try:
+            pid = int(self._sp.piece_to_id(piece))
+        except Exception:
+            return None
+        return pid if pid >= 0 else None
+
+    # ---------------------------------------------------------------- interface
     def encode(self, s: str) -> List[int]:
-        b = s.encode("utf-8", errors="ignore")[: self.vocab_size - 3]
-        return [self.BOS] + [int(x) + 3 for x in b] + [self.EOS]
+        if not isinstance(s, str):
+            s = str(s)
+
+        tokens: List[int] = [self.BOS]
+        segments: List[str]
+        if self._sp is not None:
+            try:
+                segments = self._sp.encode(s, out_type=str)
+            except Exception:
+                segments = [s]
+        else:
+            segments = [s]
+
+        for seg in segments:
+            best: Optional[List[int]] = None
+
+            if self._sp is not None:
+                pid = self._sp_piece_to_id(seg)
+                if pid is not None and 0 <= pid < self._sp_vocab:
+                    best = [self._sp_base + pid]
+
+            if self._tt is not None:
+                try:
+                    tt_raw = self._tt.encode(seg)
+                except Exception:
+                    tt_raw = []
+                tt_ids = [self._tt_base + int(tid) for tid in tt_raw if tid < self._tt_vocab]
+                if tt_ids and (best is None or len(tt_ids) < len(best)):
+                    best = tt_ids
+
+            if not best:
+                best = self._encode_bytes(seg)
+
+            if not best:
+                # Absolute fallback: character-wise (may still be empty for whitespace)
+                for ch in seg:
+                    ch_ids = self._encode_bytes(ch)
+                    if ch_ids:
+                        tokens.extend(ch_ids)
+                continue
+
+            tokens.extend(best)
+
+        tokens.append(self.EOS)
+        return tokens
 
     def decode(self, ids: List[int]) -> str:
-        b = [max(0, min(255, i - 3)) for i in ids if i >= 3]
-        return bytes(b).decode("utf-8", errors="ignore")
+        pieces: List[str] = []
+
+        sp_buffer: List[int] = []
+        tt_buffer: List[int] = []
+
+        def _flush_sp():
+            if not sp_buffer or self._sp is None:
+                sp_buffer.clear()
+                return
+            try:
+                pieces.append(self._sp.decode_ids(sp_buffer))
+            except Exception:
+                for pid in sp_buffer:
+                    try:
+                        pieces.append(self._sp.id_to_piece(pid))
+                    except Exception:
+                        continue
+            finally:
+                sp_buffer.clear()
+
+        def _flush_tt():
+            if not tt_buffer or self._tt is None:
+                tt_buffer.clear()
+                return
+            try:
+                pieces.append(self._tt.decode(tt_buffer))
+            except Exception:
+                for tid in tt_buffer:
+                    try:
+                        pieces.append(self._tt.decode([tid]))
+                    except Exception:
+                        continue
+            finally:
+                tt_buffer.clear()
+
+        for tid in ids:
+            if tid in (self.PAD, self.BOS, self.EOS):
+                continue
+            if self._sp is not None and self._sp_base <= tid < self._sp_base + self._sp_vocab:
+                _flush_tt()
+                sp_buffer.append(int(tid - self._sp_base))
+                continue
+            if self._tt is not None and self._tt_base <= tid < self._tt_base + self._tt_vocab:
+                _flush_sp()
+                tt_buffer.append(int(tid - self._tt_base))
+                continue
+
+            _flush_sp()
+            _flush_tt()
+
+            if self._byte_fallback and self._byte_base <= tid < self._byte_base + 256:
+                pieces.append(
+                    bytes([int(tid - self._byte_base)]).decode("utf-8", errors="ignore")
+                )
+
+        _flush_sp()
+        _flush_tt()
+
+        text = "".join(pieces)
+        if self._sp is not None:
+            text = text.replace("\u2581", " ")
+        return text
 
 
 # ====== RMSNorm / SwiGLU / Rotary ===========================================
@@ -2241,7 +2532,7 @@ class TrainConfig:
     loader_pin_memory: bool = False
     prefetch_to_device: bool = True
     disallow_mps_fallback: bool = True
-    auto_mps_7b: bool = False
+    auto_mps_7b: bool = True
     auto_mps_param_threshold: int = 5_000_000_000
     auto_mps_target_seq: int = 4096
     auto_mps_token_budget: int = 8192
@@ -3143,6 +3434,17 @@ class AetherTrainerBase:
 
         wd = 0.01
 
+        self._strict_loss_guard = os.environ.get("AETHER_STRICT_LOSS_GUARD", "1") != "0"
+        self._strict_activation_guard = (
+            os.environ.get("AETHER_STRICT_ACT_GUARD", "0") != "0"
+        )
+        self._suppress_numeric_traceback = (
+            os.environ.get("AETHER_SUPPRESS_NUMERIC_TRACEBACK", "1") != "0"
+        )
+        self._nonfinite_event_verbose = (
+            os.environ.get("AETHER_NONFINITE_VERBOSE", "1") != "0"
+        )
+
         # ultramem optimizer factory (if autopatch installed)
         if (up is not None) and hasattr(self.model, "_ultramem_make_optimizer"):
             self.opt = self.model._ultramem_make_optimizer(lr=self.cfg.lr, wd=wd)
@@ -3815,6 +4117,16 @@ class AetherTrainerMPS(AetherTrainerBase):
                                 device_type="mps", dtype=self.amp_dtype
                             ):
                                 logits, lvi_logs = self._compute_logits(subx)
+                                if self._strict_activation_guard:
+                                    logits = self._sanitize_tensor(
+                                        logits, "forward.logits", step
+                                    )
+                                if isinstance(lvi_logs, dict):
+                                    for _lk in ("mv_reg", "two_view"):
+                                        if _lk in lvi_logs:
+                                            lvi_logs[_lk] = self._sanitize_loss_value(
+                                                lvi_logs[_lk], f"lvi.{_lk}", step
+                                            )
                                 _pf = {}
                                 try:
                                     _pf = self._ai.post_forward_assess(
@@ -3825,6 +4137,9 @@ class AetherTrainerMPS(AetherTrainerBase):
                             # ★ CE は常に FP32・autocast 無効で計算（数値安定のため）
                             with torch.autocast(device_type="mps", enabled=False):
                                 loss_ce = self._ce_loss(logits, suby, pad_id)
+                                loss_ce = self._sanitize_loss_value(
+                                    loss_ce, "loss_ce", step
+                                )
                                 loss = (
                                     loss_ce
                                     + float(self.cfg.lvi_mv_weight) * lvi_logs["mv_reg"]
@@ -3858,9 +4173,11 @@ class AetherTrainerMPS(AetherTrainerBase):
                                             t_pos = self._teacher(subx).to(
                                                 E_bar.device, dtype=E_bar.dtype
                                             )
-                                        loss = loss + float(self._k_reg_w) * khuber_loss(
-                                            E_bar, t_pos, delta=1.0
+                                        reg = khuber_loss(E_bar, t_pos, delta=1.0)
+                                        reg = self._sanitize_loss_value(
+                                            reg, "kbridge", step
                                         )
+                                        loss = loss + float(self._k_reg_w) * reg
                                     except Exception:
                                         pass
 
@@ -3898,6 +4215,9 @@ class AetherTrainerMPS(AetherTrainerBase):
                                                         )
                                                     ),
                                                 )
+                                                loss_int = self._sanitize_loss_value(
+                                                    loss_int, "intent_loss", step
+                                                )
                                                 loss = (
                                                     loss
                                                     + float(self.cfg.intent_weight)
@@ -3906,7 +4226,11 @@ class AetherTrainerMPS(AetherTrainerBase):
                                         except Exception:
                                             pass
 
+                                loss = self._sanitize_loss_value(loss, "loss", step)
                                 loss = loss / max(1, current_micro)
+                                loss = self._sanitize_loss_value(
+                                    loss, "loss_scaled", step
+                                )
                         except RuntimeError as e:
                             if self._maybe_handle_oom(e, B):
                                 restart_batch = True
@@ -3922,6 +4246,7 @@ class AetherTrainerMPS(AetherTrainerBase):
                         if restart_batch:
                             break
 
+                        backward_ok = True
                         if _pf.get("hazard", False):
                             try:
                                 self._ai.sanitize_gradients(self.model)
@@ -3931,10 +4256,9 @@ class AetherTrainerMPS(AetherTrainerBase):
                             if self.scaler is not None:
                                 self.scaler.update()
                         else:
-                            if self.scaler is not None:
-                                self.scaler.scale(loss).backward()
-                            else:
-                                loss.backward()
+                            backward_ok = self._backward_with_guard(loss, step)
+                        if not backward_ok:
+                            continue
                         # ANI-AI observe grads
                         try:
                             self._ai.observe_grads(self.model)
@@ -3961,11 +4285,7 @@ class AetherTrainerMPS(AetherTrainerBase):
                                     self.scaler.update()
                                 self.opt.zero_grad(set_to_none=True)
                             else:
-                                if self.scaler is not None:
-                                    self.scaler.step(self.opt)
-                                    self.scaler.update()
-                                else:
-                                    self.opt.step()
+                                self._optimizer_step_with_guard(step)
                                 self.opt.zero_grad(set_to_none=True)
                             # ANI-AI decide/act
                             try:
@@ -4009,11 +4329,7 @@ class AetherTrainerMPS(AetherTrainerBase):
                             self.scaler.update()
                         self.opt.zero_grad(set_to_none=True)
                     else:
-                        if self.scaler is not None:
-                            self.scaler.step(self.opt)
-                            self.scaler.update()
-                        else:
-                            self.opt.step()
+                        self._optimizer_step_with_guard(step)
                         self.opt.zero_grad(set_to_none=True)
                     # ANI-AI decide/act
                     try:
@@ -4567,11 +4883,19 @@ class AetherTrainerMPS(AetherTrainerBase):
         return True
 
     def _zero_nonfinite_grads(self):
+        had_issue = False
         for p in self.model.parameters():
             if p.grad is None:
                 continue
-            if not torch.isfinite(p.grad).all():
-                p.grad.zero_()
+            finite = torch.isfinite(p.grad)
+            if finite.all():
+                continue
+            p.grad.zero_()
+            had_issue = True
+        if had_issue:
+            self._emit_nonfinite_event(
+                "grad", self._global_step, detail="gradients zeroed"
+            )
 
     @property
     def tok_per_sec(self) -> float:
@@ -4580,6 +4904,125 @@ class AetherTrainerMPS(AetherTrainerBase):
     @property
     def tok_per_sec_ema(self) -> float:
         return float(self._last_tok_per_sec_ema)
+
+    def _emit_nonfinite_event(self, where: str, step: int, detail: str = ""):
+        if self._nonfinite_event_verbose:
+            msg = f"[SAFE] non-finite sanitized at step={int(step)} ({where})"
+            if detail:
+                msg += f" :: {detail}"
+            print(msg)
+        evt = {"event": "nonfinite", "where": where, "step": int(step), "detail": detail}
+        bus = globals().get("_AETHER_EVENT_BUS")
+        if bus is not None:
+            try:
+                bus.emit(evt)
+            except Exception:
+                pass
+        else:
+            manager = getattr(self, "_ani_manager", None)
+            if manager is not None:
+                try:
+                    manager.on_nonfinite(evt)
+                except Exception:
+                    pass
+
+    def _sanitize_loss_value(self, value, name: str, step: int):
+        if not self._strict_loss_guard or value is None:
+            return value
+        if torch.is_tensor(value):
+            try:
+                finite = torch.isfinite(value)
+            except Exception:
+                return value
+            if finite.all():
+                return value
+            sanitized = torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
+            detail = ""
+            try:
+                detail = f"value={float(value.detach().cpu().item()):.4g}"
+            except Exception:
+                try:
+                    nf = int((~finite).sum().item())
+                    detail = f"nonfinite={nf}/{int(finite.numel())}"
+                except Exception:
+                    detail = "nonfinite"
+            self._emit_nonfinite_event(name, step, detail=detail)
+            return sanitized
+        if isinstance(value, (float, int)):
+            if math.isfinite(float(value)):
+                return value
+            self._emit_nonfinite_event(name, step, detail=f"value={value}")
+            return 0.0
+        return value
+
+    def _sanitize_tensor(self, tensor: torch.Tensor, name: str, step: int):
+        if tensor is None or not torch.is_tensor(tensor):
+            return tensor
+        try:
+            finite = torch.isfinite(tensor)
+        except Exception:
+            return tensor
+        if finite.all():
+            return tensor
+        sanitized = torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
+        detail = ""
+        try:
+            nf = int((~finite).sum().item())
+            detail = f"nonfinite={nf}/{int(finite.numel())}"
+        except Exception:
+            detail = "nonfinite"
+        self._emit_nonfinite_event(name, step, detail=detail)
+        return sanitized
+
+    def _is_numeric_error(self, err: BaseException) -> bool:
+        if err is None:
+            return False
+        msg = str(err).lower()
+        for key in ("nan", "inf", "overflow", "out of range", "invalid value"):
+            if key in msg:
+                return True
+        return False
+
+    def _backward_with_guard(self, loss: torch.Tensor, step: int) -> bool:
+        try:
+            if self.scaler is not None:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            return True
+        except RuntimeError as err:
+            if self._suppress_numeric_traceback and self._is_numeric_error(err):
+                self._emit_nonfinite_event("backward", step, detail=str(err))
+                try:
+                    self.opt.zero_grad(set_to_none=True)
+                except Exception:
+                    pass
+                if self.scaler is not None:
+                    try:
+                        self.scaler.update()
+                    except Exception:
+                        pass
+                return False
+            raise
+
+    def _optimizer_step_with_guard(self, step: int) -> bool:
+        try:
+            if self.scaler is not None:
+                self.scaler.step(self.opt)
+                self.scaler.update()
+            else:
+                self.opt.step()
+            return True
+        except RuntimeError as err:
+            if self._suppress_numeric_traceback and self._is_numeric_error(err):
+                self._emit_nonfinite_event("optimizer_step", step, detail=str(err))
+                if self.scaler is not None:
+                    try:
+                        self.scaler.update()
+                    except Exception:
+                        pass
+                return False
+            raise
 
 
 # ====== Lightning Fabric (optional placeholder) =============================
@@ -4632,6 +5075,202 @@ def save_lora_safetensors_if_any(model, out_dir: str, step: int):
         return False
 
 
+def _coerce_config_value(value: Any, template: Any) -> Any:
+    if template is None:
+        return value
+    try:
+        if isinstance(template, bool):
+            if isinstance(value, str):
+                return value.strip().lower() in {"1", "true", "yes", "on"}
+            return bool(value)
+        if isinstance(template, int) and not isinstance(template, bool):
+            if isinstance(value, bool):
+                return int(value)
+            return int(value)
+        if isinstance(template, float):
+            return float(value)
+        if isinstance(template, str):
+            return str(value)
+    except Exception:
+        return value
+    return value
+
+
+def _resolve_config_path(path: str) -> str:
+    if not path:
+        return ""
+    expanded = os.path.expanduser(path)
+    if os.path.isdir(expanded):
+        for candidate in (
+            "aether.config.json",
+            "aether_config.json",
+            "config.json",
+        ):
+            sub = os.path.join(expanded, candidate)
+            if os.path.isfile(sub):
+                return os.path.abspath(sub)
+        return ""
+    if os.path.isfile(expanded):
+        return os.path.abspath(expanded)
+    return ""
+
+
+def _auto_detect_config_path() -> str:
+    cwd = os.getcwd()
+    candidates = [
+        os.path.join(cwd, "aether.config.json"),
+        os.path.join(cwd, "aether_config.json"),
+        os.path.join(cwd, "config", "aether.json"),
+        os.path.join(cwd, "config", "config.json"),
+        os.path.join(cwd, "configs", "aether.json"),
+        os.path.join(cwd, "config.json"),
+    ]
+    for cand in candidates:
+        if os.path.isfile(cand):
+            return os.path.abspath(cand)
+    config_dir = os.path.join(cwd, "configs")
+    try:
+        jsons = [
+            os.path.join(config_dir, name)
+            for name in os.listdir(config_dir)
+            if name.lower().endswith(".json")
+        ]
+        if len(jsons) == 1 and os.path.isfile(jsons[0]):
+            return os.path.abspath(jsons[0])
+    except OSError:
+        pass
+    return ""
+
+
+def _load_config_overrides(path: str) -> Dict[str, Any]:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        print(f"[CONFIG] failed to load {path!r}: {exc}")
+        return {}
+    if not isinstance(data, dict):
+        print(f"[CONFIG] {path!r} does not contain a JSON object; ignoring")
+        return {}
+    return data
+
+
+def _auto_find_any(patterns: List[str]) -> str:
+    for pat in patterns:
+        recursive = "**" in pat
+        try:
+            it = glob.iglob(pat, recursive=recursive)
+            next(it)
+            return pat
+        except StopIteration:
+            continue
+        except OSError:
+            continue
+    return ""
+
+
+def _auto_discover_corpus(kind: str) -> str:
+    if kind == "train":
+        patterns = [
+            "data/train/**/*.txt",
+            "data/train/**/*.jsonl",
+            "data/train/**/*.json",
+            "datasets/train/**/*.txt",
+            "datasets/train/**/*.jsonl",
+            "datasets/**/*.txt",
+            "datasets/**/*.jsonl",
+            "data/**/*.txt",
+            "data/**/*.jsonl",
+        ]
+    else:
+        patterns = [
+            "data/val/**/*.txt",
+            "data/val/**/*.jsonl",
+            "data/valid/**/*.txt",
+            "data/valid/**/*.jsonl",
+            "data/validation/**/*.txt",
+            "data/validation/**/*.jsonl",
+            "datasets/val/**/*.txt",
+            "datasets/val/**/*.jsonl",
+            "datasets/valid/**/*.txt",
+            "datasets/valid/**/*.jsonl",
+        ]
+    return _auto_find_any(patterns)
+
+
+def _auto_bootstrap_runtime(
+    args: argparse.Namespace,
+    defaults: argparse.Namespace,
+    override_keys: set,
+    device: torch.device,
+) -> None:
+    notes: List[str] = []
+
+    def _is_default(name: str) -> bool:
+        if name in override_keys:
+            return False
+        if not hasattr(args, name) or not hasattr(defaults, name):
+            return False
+        return getattr(args, name) == getattr(defaults, name)
+
+    def _apply(name: str, value: Any) -> None:
+        setattr(args, name, value)
+        notes.append(f"{name}={value!r}")
+
+    # Auto-discover training corpus
+    if _is_default("train_glob") or not getattr(args, "train_glob", ""):
+        train_pat = _auto_discover_corpus("train")
+        if train_pat:
+            _apply("train_glob", train_pat)
+            if not getattr(args, "train_stream", False) and _is_default("train_stream"):
+                _apply("train_stream", True)
+
+    # Auto-discover validation corpus if unset
+    if (_is_default("val_glob") or not getattr(args, "val_glob", "")) and getattr(
+        args, "train_glob", ""
+    ):
+        val_pat = _auto_discover_corpus("val")
+        if val_pat:
+            _apply("val_glob", val_pat)
+
+    # Ensure micro-batch does not exceed global batch
+    if (
+        hasattr(args, "batch_size")
+        and hasattr(args, "micro_batch")
+        and int(getattr(args, "micro_batch", 0)) > max(1, int(getattr(args, "batch_size", 1)))
+        and _is_default("micro_batch")
+    ):
+        _apply("micro_batch", max(1, int(args.batch_size)))
+
+    # Align pack length with target sequence length when possible
+    if hasattr(args, "pack_len") and hasattr(args, "max_len") and _is_default("pack_len"):
+        max_len = max(32, int(getattr(args, "max_len", 1024)))
+        desired_pack = min(max_len, 2048)
+        if desired_pack != int(getattr(args, "pack_len", desired_pack)):
+            _apply("pack_len", desired_pack)
+    if hasattr(args, "pack_len") and hasattr(args, "buffer_size") and _is_default(
+        "buffer_size"
+    ):
+        pack_len = int(getattr(args, "pack_len", 1024))
+        desired_buffer = max(int(getattr(args, "buffer_size", 8192)), pack_len * 4)
+        if desired_buffer != int(getattr(args, "buffer_size", desired_buffer)):
+            _apply("buffer_size", desired_buffer)
+
+    # Tune auto MPS token budget if still default
+    if device.type == "mps" and _is_default("auto_mps_token_budget"):
+        target_seq = int(getattr(args, "auto_mps_target_seq", getattr(args, "max_len", 1024)))
+        max_len = int(getattr(args, "max_len", target_seq))
+        batch = max(1, int(getattr(args, "batch_size", 1)))
+        desired_budget = max(target_seq, max_len * batch)
+        if desired_budget != int(getattr(args, "auto_mps_token_budget", desired_budget)):
+            _apply("auto_mps_token_budget", desired_budget)
+
+    if notes:
+        print("[AUTO] runtime tuned:", ", ".join(notes))
+
+
 def __aether_main__():
     def _require_mps():
         if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
@@ -4644,10 +5283,14 @@ def __aether_main__():
             return 0
         return sum(1 for _ in glob.iglob(pattern, recursive=True))
 
-    import argparse
-
     ap = argparse.ArgumentParser()
     # data
+    ap.add_argument(
+        "--config",
+        type=str,
+        default="",
+        help="Path to config JSON (auto-detected if omitted)",
+    )
     ap.add_argument("--demo", action="store_true")
     ap.add_argument("--train_stream", action="store_true")
     ap.add_argument("--train_glob", type=str, default="")
@@ -4661,6 +5304,18 @@ def __aether_main__():
     ap.add_argument("--no_prefetch_to_device", action="store_true")
     # model
     ap.add_argument("--vocab_size", type=int, default=32000)
+    ap.add_argument("--sp_model", type=str, default="", help="SentencePiece model path")
+    ap.add_argument(
+        "--tiktoken_encoding",
+        type=str,
+        default="",
+        help="Name of the TikToken encoding to blend (e.g. 'cl100k_base')",
+    )
+    ap.add_argument(
+        "--disable_byte_fallback",
+        action="store_true",
+        help="Disable byte-level fallback tokens in the hybrid tokenizer",
+    )
     ap.add_argument("--d_model", type=int, default=4096)
     ap.add_argument("--n_layers", type=int, default=32)
     ap.add_argument("--n_heads", type=int, default=32)
@@ -4725,6 +5380,7 @@ def __aether_main__():
     ap.add_argument("--lora_alpha", type=int, default=320)
     ap.add_argument("--lora_dropout", type=float, default=0.05)
     ap.add_argument("--auto_mps_7b", action="store_true")
+    ap.add_argument("--no_auto_mps_7b", action="store_true")
     ap.add_argument("--auto_mps_target_seq", type=int, default=4096)
     ap.add_argument("--auto_mps_token_budget", type=int, default=8192)
     ap.add_argument("--auto_mps_min_micro_batch", type=int, default=1)
@@ -4746,12 +5402,80 @@ def __aether_main__():
         default=0,
         help="Save LoRA weights to safetensors every N steps (0=off)",
     )
+    defaults = ap.parse_args([])
     args = ap.parse_args()
 
-    set_seed(1337)
+    config_candidates = []
+    if getattr(args, "config", ""):
+        config_candidates.append(args.config)
+    env_cfg = os.environ.get("AETHER_CONFIG", "").strip()
+    if env_cfg:
+        config_candidates.append(env_cfg)
+    auto_cfg = _auto_detect_config_path()
+    if auto_cfg:
+        config_candidates.append(auto_cfg)
+
+    config_path = ""
+    overrides: Dict[str, Any] = {}
+    for cand in config_candidates:
+        resolved = _resolve_config_path(cand)
+        if not resolved:
+            continue
+        overrides = _load_config_overrides(resolved)
+        config_path = resolved
+        if overrides:
+            break
+    if config_path:
+        args.config = config_path
+    override_keys = set()
+    if overrides:
+        print(f"[CONFIG] loaded overrides from {config_path}")
+        for key, value in overrides.items():
+            if key == "config" or not hasattr(args, key):
+                continue
+            if not hasattr(defaults, key):
+                continue
+            current = getattr(args, key)
+            default_value = getattr(defaults, key)
+            if current != default_value:
+                continue
+            coerced = _coerce_config_value(value, default_value)
+            try:
+                setattr(args, key, coerced)
+                override_keys.add(key)
+                print(f"[CONFIG] {key} <- {coerced!r}")
+            except Exception as exc:
+                print(f"[CONFIG] failed to apply {key!r}: {exc}")
+    elif config_path:
+        print(f"[CONFIG] detected {config_path} (no overrides applied)")
+
     device = detect_device()
 
-    tok = ByteTokenizer(vocab_size=args.vocab_size)
+    _auto_bootstrap_runtime(args, defaults, override_keys, device)
+
+    if getattr(args, "no_auto_mps_7b", False):
+        args.auto_mps_7b = False
+    elif (
+        getattr(args, "auto_mps_7b", False) == getattr(defaults, "auto_mps_7b", False)
+        and "auto_mps_7b" not in override_keys
+        and device.type == "mps"
+    ):
+        args.auto_mps_7b = True
+        print("[CONFIG] auto_mps_7b enabled by default (MPS detected)")
+
+    set_seed(1337)
+
+    tok = ByteTokenizer(
+        vocab_size=args.vocab_size,
+        sp_model_path=args.sp_model or None,
+        tiktoken_encoding=args.tiktoken_encoding or None,
+        byte_fallback=not getattr(args, "disable_byte_fallback", False),
+    )
+    if tok.vocab_size != args.vocab_size:
+        print(
+            f"[TOK] adjusted vocab size from {args.vocab_size} to {tok.vocab_size} to accommodate hybrid ranges"
+        )
+        args.vocab_size = tok.vocab_size
     kvh = args.kv_heads if args.kv_heads and args.kv_heads > 0 else None
     model = AetherPumpSimple(
         vocab_size=args.vocab_size,
@@ -6006,6 +6730,3 @@ def _install_spiral_guardian_from_env(trainer):
     except Exception as e:
         print("[GUARD] install failed:", e)
         return None
-
-# =============================================================================
-
