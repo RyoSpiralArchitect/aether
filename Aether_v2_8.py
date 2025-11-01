@@ -2542,6 +2542,14 @@ class TrainConfig:
     mps_7b_lora_dropout: float = 0.05
     mps_7b_int8_exclude: Tuple[str, ...] = ("emb", "head")
     mps_7b_skip_if_out_equals: Optional[int] = None
+    # Turbo governor (MPS throughput tuning)
+    turbo_target_tok: float = 2000.0
+    turbo_window: int = 6
+    turbo_cooldown: int = 48
+    turbo_seq_floor: int = 512
+    turbo_seq_step: int = 256
+    turbo_disable_metrics_ratio: float = 0.75
+    turbo_micro_floor: int = 1
 
 
 def _auto_tune_for_mps_7b(
@@ -2698,6 +2706,22 @@ def _auto_tune_for_mps_7b(
         "tps_boost_patience",
         cfg.tps_boost_patience,
         max(cfg.tps_boost_patience, 16),
+    )
+    cfg.turbo_target_tok = _update(
+        "turbo_target_tok", cfg.turbo_target_tok, max(cfg.turbo_target_tok, 2000.0)
+    )
+    cfg.turbo_seq_floor = _update(
+        "turbo_seq_floor", cfg.turbo_seq_floor, max(128, min(cfg.turbo_seq_floor, target_seq))
+    )
+    cfg.turbo_seq_step = _update(
+        "turbo_seq_step",
+        cfg.turbo_seq_step,
+        max(cfg.turbo_seq_step, max(64, target_seq // 4)),
+    )
+    cfg.turbo_micro_floor = _update(
+        "turbo_micro_floor",
+        cfg.turbo_micro_floor,
+        max(cfg.turbo_micro_floor, min_micro),
     )
 
     env_updates: Dict[str, Any] = {}
@@ -2954,6 +2978,142 @@ class ThroughputMeter:
         self._updates = 0
         self.total_tokens = 0.0
         self.total_seconds = 0.0
+
+
+class MPSTurboGovernor:
+    """Adaptive throughput governor targeting >2k tok/s on MPS."""
+
+    def __init__(
+        self,
+        trainer,
+        *,
+        target_tok: float,
+        window: int,
+        cooldown: int,
+        micro_floor: int,
+        seq_floor: int,
+        seq_step: int,
+        disable_metrics_ratio: float,
+    ):
+        self.trainer = trainer
+        self.target = max(0.0, float(target_tok))
+        self.window = max(1, int(window))
+        self.cooldown = max(1, int(cooldown))
+        self.micro_floor = max(1, int(micro_floor))
+        self.seq_floor = max(128, int(seq_floor))
+        self.seq_step = max(32, int(seq_step))
+        self.disable_metrics_ratio = float(min(max(disable_metrics_ratio, 0.0), 0.99))
+        base_candidates = [
+            int(getattr(trainer.cfg, "max_len", 0) or 0),
+            int(getattr(trainer, "_token_sequence", 0) or 0),
+        ]
+        self.base_seq = max([c for c in base_candidates if c > 0] or [2048])
+        self.enabled = self.target > 0.0 and getattr(trainer.device, "type", "cpu") == "mps"
+        self.low_strike = 0
+        self.high_strike = 0
+        self.last_adjust = -10**9
+        self.best = 0.0
+        self.history: Deque[float] = deque(maxlen=self.window)
+
+    def _shed_metrics(self, step: int, ema: float, low_bar: float):
+        tr = self.trainer
+        if not getattr(tr, "_turbo_metrics_suppressed", False):
+            print(
+                f"[TURBO] shedding auxiliary metrics (ema={ema:.1f} < {low_bar:.1f} tok/s)"
+            )
+        tr._turbo_metrics_suppressed = True
+        tr._turbo_metrics_release_step = step + self.cooldown
+        tr._turbo_disable_kbridge = True
+
+    def _restore_metrics(self):
+        tr = self.trainer
+        if getattr(tr, "_turbo_metrics_suppressed", False):
+            print("[TURBO] auxiliary metrics restored")
+        tr._turbo_metrics_suppressed = False
+        tr._turbo_disable_kbridge = False
+
+    def update(
+        self,
+        step: int,
+        instant_tps: float,
+        ema_tps: float,
+        stats: ThroughputStats,
+        total_tok: int,
+        chunk_hint: float,
+    ):
+        if not self.enabled:
+            return
+        chunk_hint_val = float(chunk_hint) if chunk_hint is not None else float(total_tok)
+        window_peak = getattr(stats, "window_max", float(instant_tps))
+        self.best = max(self.best, float(max(window_peak, instant_tps)))
+        self.history.append(float(ema_tps))
+        low_bar = self.target * max(0.25, self.disable_metrics_ratio)
+        high_bar = self.target * 0.97 if self.target > 0 else float("inf")
+
+        if ema_tps < low_bar:
+            self.low_strike += 1
+            self.high_strike = 0
+            self._shed_metrics(step, ema_tps, low_bar)
+        elif (
+            getattr(self.trainer, "_turbo_metrics_suppressed", False)
+            and ema_tps >= self.target * 0.9
+            and step >= getattr(self.trainer, "_turbo_metrics_release_step", 0)
+        ):
+            self._restore_metrics()
+            self.low_strike = 0
+            self.high_strike += 1
+        elif ema_tps > high_bar:
+            self.low_strike = 0
+            self.high_strike += 1
+        else:
+            self.low_strike = 0
+            self.high_strike = 0
+
+        if (
+            self.low_strike >= self.window
+            and (step - self.last_adjust) >= self.cooldown
+        ):
+            tr = self.trainer
+            current_micro = max(1, int(getattr(tr, "_micro_active", 1)))
+            if current_micro > max(self.micro_floor, int(getattr(tr, "_micro_base", 1)) // 2):
+                new_micro = max(self.micro_floor, current_micro - 1)
+                if new_micro < current_micro:
+                    tr._micro_active = new_micro
+                    tr._micro_stable = 0
+                    print(
+                        f"[TURBO] micro_batch tightened to {new_micro} (ema={ema_tps:.1f} tok/s, target={self.target:.1f}, chunk≈{chunk_hint_val:.0f})"
+                    )
+                    self.last_adjust = step
+                    return
+            base_seq = max(self.base_seq, int(getattr(tr.cfg, "max_len", self.base_seq)))
+            current_cap = int(getattr(tr, "_turbo_max_len", 0) or base_seq)
+            new_cap = max(self.seq_floor, current_cap - self.seq_step)
+            if new_cap < current_cap:
+                tr._turbo_set_sequence_cap(new_cap)
+                self.last_adjust = step
+                return
+
+        if (
+            self.high_strike >= self.window
+            and (step - self.last_adjust) >= self.cooldown
+        ):
+            tr = self.trainer
+            changed = False
+            if getattr(tr, "_turbo_max_len", 0):
+                changed = tr._turbo_relax_sequence_cap(self.seq_step)
+            if not changed and int(getattr(tr, "_micro_active", 1)) < int(
+                getattr(tr, "_micro_base", 1)
+            ):
+                tr._micro_active = min(
+                    int(tr._micro_base), int(tr._micro_active) + 1
+                )
+                tr._micro_stable = 0
+                print(
+                    f"[TURBO] micro_batch relaxed to {tr._micro_active} (ema={ema_tps:.1f} tok/s, chunk≈{chunk_hint_val:.0f})"
+                )
+                changed = True
+            if changed:
+                self.last_adjust = step
 
 
 class EMAMeter:
@@ -3573,6 +3733,36 @@ class AetherTrainerBase:
             print(
                 f"[ADAPT] micro_batch base={self._micro_base}, cap={self._micro_cap}"
             )
+        self._micro_floor = max(1, int(getattr(self.cfg, "turbo_micro_floor", 1)))
+        if self._micro_active < self._micro_floor:
+            self._micro_active = self._micro_floor
+        if self._micro_base < self._micro_floor:
+            self._micro_base = self._micro_floor
+        if self._micro_cap < self._micro_floor:
+            self._micro_cap = self._micro_floor
+        self._turbo_seq_step = max(32, int(getattr(self.cfg, "turbo_seq_step", 256)))
+        self._turbo_seq_floor = max(128, int(getattr(self.cfg, "turbo_seq_floor", 512)))
+        base_seq_candidates = [
+            int(getattr(self.cfg, "max_len", 0) or 0),
+            int(self._token_sequence or 0),
+        ]
+        self._turbo_base_seq = max([c for c in base_seq_candidates if c > 0] or [self.cfg.max_len])
+        self._turbo_max_len = 0
+        self._turbo_metrics_suppressed = False
+        self._turbo_metrics_release_step = 0
+        self._turbo_disable_kbridge = False
+        self._turbo = MPSTurboGovernor(
+            self,
+            target_tok=float(getattr(self.cfg, "turbo_target_tok", 0.0)),
+            window=int(getattr(self.cfg, "turbo_window", 6)),
+            cooldown=int(getattr(self.cfg, "turbo_cooldown", 48)),
+            micro_floor=self._micro_floor,
+            seq_floor=self._turbo_seq_floor,
+            seq_step=self._turbo_seq_step,
+            disable_metrics_ratio=float(
+                getattr(self.cfg, "turbo_disable_metrics_ratio", 0.75)
+            ),
+        )
         # --- k-bridge integration knobs (safe opt-in; default on if installed) ---
         requested_k = bool(
             int(os.environ.get("KBRIDGE_ENABLE", "1" if _KBRIDGE_AVAILABLE else "0"))
@@ -3705,6 +3895,51 @@ class AetherTrainerBase:
         tensors, stream = self._device_async_copy(*batch)
         self._wait_stream(stream)
         return tensors
+
+    def _turbo_set_sequence_cap(self, new_cap: int):
+        base = max(1, int(self._turbo_base_seq))
+        new_cap = int(new_cap)
+        if new_cap <= 0 or new_cap >= base:
+            if self._turbo_max_len != 0:
+                print(
+                    f"[TURBO] sequence cap cleared; full {base}-token context restored"
+                )
+            self._turbo_max_len = 0
+            return
+        if self._turbo_max_len == new_cap:
+            return
+        self._turbo_max_len = new_cap
+        print(f"[TURBO] sequence cap set to {new_cap} tokens (base={base})")
+
+    def _turbo_relax_sequence_cap(self, step_size: int) -> bool:
+        if self._turbo_max_len <= 0:
+            return False
+        base = max(1, int(self._turbo_base_seq))
+        step_size = max(1, int(step_size))
+        new_cap = min(base, self._turbo_max_len + step_size)
+        if new_cap >= base:
+            self._turbo_max_len = 0
+            print(
+                f"[TURBO] sequence cap cleared; full {base}-token context restored"
+            )
+            return True
+        if new_cap != self._turbo_max_len:
+            self._turbo_max_len = new_cap
+            print(f"[TURBO] sequence cap relaxed to {new_cap}")
+            return True
+        return False
+
+    def _turbo_update(
+        self,
+        step: int,
+        instant_tps: float,
+        ema_tps: float,
+        stats: ThroughputStats,
+        total_tok: int,
+        chunk_hint: float,
+    ):
+        if isinstance(getattr(self, "_turbo", None), MPSTurboGovernor):
+            self._turbo.update(step, instant_tps, ema_tps, stats, total_tok, chunk_hint)
 
     def _stabilize_loss_value(self, loss_avg: float) -> float:
         guard = max(0.0, self._loss_guard)
@@ -3980,6 +4215,8 @@ class AetherTrainerMPS(AetherTrainerBase):
                 return None
             params = curr_params(int(step_hint))
             max_len = int(params.get("max_len", bx.size(1)))
+            if getattr(self, "_turbo_max_len", 0):
+                max_len = min(max_len, int(self._turbo_max_len))
             if max_len < bx.size(1):
                 bx = bx[:, :max_len]
                 by = by[:, :max_len]
@@ -4043,6 +4280,12 @@ class AetherTrainerMPS(AetherTrainerBase):
                     total_tok = 0
                     accum = 0
                     idx = 0
+                    total_loss_tensor = torch.zeros(
+                        (), device=self.device, dtype=torch.float32
+                    )
+                    total_tok_tensor = torch.zeros(
+                        (), device=self.device, dtype=torch.float32
+                    )
                     restart_batch = False
                     batch_on_device = device_cache
                     batch_stream = None
@@ -4267,9 +4510,11 @@ class AetherTrainerMPS(AetherTrainerBase):
                         self._zero_nonfinite_grads()
                         accum += 1
 
-                        ntok = int((suby != pad_id).sum().item())
-                        total_tok += ntok
-                        total_loss += float(loss_ce.detach().cpu().item()) * ntok
+                        tok_tensor = (suby != pad_id).sum().to(total_tok_tensor.dtype)
+                        total_tok_tensor = total_tok_tensor + tok_tensor
+                        total_loss_tensor = total_loss_tensor + loss_ce.detach().to(
+                            total_loss_tensor.dtype
+                        ) * tok_tensor
 
                         current_micro = max(1, int(self._micro_active))
                         if accum >= current_micro:
@@ -4359,6 +4604,8 @@ class AetherTrainerMPS(AetherTrainerBase):
                     except Exception:
                         pass
 
+                total_tok = int(total_tok_tensor.item())
+                total_loss = float(total_loss_tensor.item())
                 raw_loss_avg = total_loss / max(1, total_tok)
                 loss_avg = self._stabilize_loss_value(raw_loss_avg)
                 loss_avg = max(0.0, loss_avg)
@@ -4371,8 +4618,7 @@ class AetherTrainerMPS(AetherTrainerBase):
                 t0 = time.time()
                 tps = float(total_tok) / max(1e-6, elapsed)
                 ema_tps = self._tps_meter.update(total_tok, elapsed)
-                tps_snapshot = self._tps_meter.snapshot()
-                tps_stats = tps_snapshot.as_dict()
+                tps_stats_obj = self._tps_meter.stats(as_dict=False)
                 self._maybe_boost_throughput(ema_tps)
                 self._last_tok_per_sec = float(tps_snapshot.instant)
                 self._last_tok_per_sec_ema = float(ema_tps)
@@ -4390,6 +4636,9 @@ class AetherTrainerMPS(AetherTrainerBase):
                     if self._token_chunk > 0
                     else float(total_tok)
                 )
+
+                self._turbo_update(step, tps, ema_tps, tps_stats_obj, total_tok, chunk_hint)
+                tps_stats = tps_stats_obj.as_dict()
 
                 if self._adaptive_micro:
                     if self._micro_active > self._micro_base:
@@ -4417,7 +4666,11 @@ class AetherTrainerMPS(AetherTrainerBase):
                         pass
 
                         # --- K metrics: token-level buffers（pmax/correct/pred/true/lenbin + groups）
-                if self._k_enabled and _KBRIDGE_AVAILABLE:
+                if (
+                    self._k_enabled
+                    and _KBRIDGE_AVAILABLE
+                    and not getattr(self, "_turbo_disable_kbridge", False)
+                ):
                     try:
                         with torch.no_grad():
                             p = torch.softmax(logits.float(), dim=-1)
@@ -4519,8 +4772,16 @@ class AetherTrainerMPS(AetherTrainerBase):
                         pass
 
                 if step % self.cfg.log_every == 0:
+                    heavy_allowed = not getattr(
+                        self, "_turbo_metrics_suppressed", False
+                    )
                     # --- Temperature sweep ECE（current batch; snapshot only）
-                    if self._k_enabled and _KBRIDGE_AVAILABLE and self._kb_tsweep:
+                    if (
+                        heavy_allowed
+                        and self._k_enabled
+                        and _KBRIDGE_AVAILABLE
+                        and self._kb_tsweep
+                    ):
                         try:
                             with torch.no_grad():
                                 for Tval in self._kb_tsweep:
@@ -4635,7 +4896,8 @@ class AetherTrainerMPS(AetherTrainerBase):
 
                     # --- K-bridge: ECE + hist（overall）/ length-bucket / classwise（拡張）
                     if (
-                        self._k_enabled
+                        heavy_allowed
+                        and self._k_enabled
                         and _KBRIDGE_AVAILABLE
                         and (step % max(1, self._kb_metrics_every) == 0)
                         and self._kb_buf_pmax
@@ -4814,7 +5076,12 @@ class AetherTrainerMPS(AetherTrainerBase):
                             pass
 
                     # --- K-bridge: sequence-level NDCG@k (external hook provided)
-                    if self._k_enabled and _KBRIDGE_AVAILABLE and self._kb_seq_scores:
+                    if (
+                        heavy_allowed
+                        and self._k_enabled
+                        and _KBRIDGE_AVAILABLE
+                        and self._kb_seq_scores
+                    ):
                         try:
                             np_mod = _require_numpy("sequence-level NDCG evaluation")
 
@@ -5342,6 +5609,14 @@ def __aether_main__():
     ap.add_argument("--window_size", type=int, default=0)
     ap.add_argument("--global_tokens", type=int, default=0)
     ap.add_argument("--global_stride", type=int, default=0)
+    # turbo governor
+    ap.add_argument("--turbo_target_tok", type=float, default=2000.0)
+    ap.add_argument("--turbo_window", type=int, default=6)
+    ap.add_argument("--turbo_cooldown", type=int, default=48)
+    ap.add_argument("--turbo_seq_floor", type=int, default=512)
+    ap.add_argument("--turbo_seq_step", type=int, default=256)
+    ap.add_argument("--turbo_disable_metrics_ratio", type=float, default=0.75)
+    ap.add_argument("--turbo_micro_floor", type=int, default=1)
     ap.add_argument("--mps_sync_every", type=int, default=0)
     ap.add_argument("--allow_mps_cpu_fallback", action="store_true")
     # optimizer
@@ -5569,6 +5844,13 @@ def __aether_main__():
         window_size=int(args.window_size),
         global_tokens=int(args.global_tokens),
         global_stride=int(args.global_stride),
+        turbo_target_tok=float(args.turbo_target_tok),
+        turbo_window=int(args.turbo_window),
+        turbo_cooldown=int(args.turbo_cooldown),
+        turbo_seq_floor=int(args.turbo_seq_floor),
+        turbo_seq_step=int(args.turbo_seq_step),
+        turbo_disable_metrics_ratio=float(args.turbo_disable_metrics_ratio),
+        turbo_micro_floor=int(args.turbo_micro_floor),
         opt_cpu8bit=bool(args.opt_cpu8bit),
         opt_galore=bool(args.opt_galore),
         galore_rank=int(args.galore_rank),
