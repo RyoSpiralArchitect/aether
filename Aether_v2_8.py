@@ -3037,7 +3037,7 @@ class MPSTurboGovernor:
         step: int,
         instant_tps: float,
         ema_tps: float,
-        stats: ThroughputStats,
+        stats: ThroughputSnapshot,
         total_tok: int,
         chunk_hint: float,
     ):
@@ -3934,7 +3934,7 @@ class AetherTrainerBase:
         step: int,
         instant_tps: float,
         ema_tps: float,
-        stats: ThroughputStats,
+        stats: ThroughputSnapshot,
         total_tok: int,
         chunk_hint: float,
     ):
