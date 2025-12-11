@@ -3037,7 +3037,7 @@ class MPSTurboGovernor:
         step: int,
         instant_tps: float,
         ema_tps: float,
-        stats: ThroughputStats,
+        stats: ThroughputSnapshot,
         total_tok: int,
         chunk_hint: float,
     ):
@@ -3204,11 +3204,12 @@ class PsyAugment:
         B, T = x.shape
         x = x.clone()
         if self.token_dropout > 0:
-            mask = torch.rand_like(
-                x,
-                dtype=torch.float32,
-                generator=self._gen,
-            ) < self.token_dropout
+            if self._gen.device == x.device:
+                mask = torch.rand(
+                    x.shape, device=x.device, dtype=torch.float32, generator=self._gen
+                ) < self.token_dropout
+            else:
+                mask = torch.rand_like(x, dtype=torch.float32) < self.token_dropout
             x.masked_fill_(mask, pad_id)
         # byte_noise / span_mask は必要なら追加
         return x
@@ -3934,7 +3935,7 @@ class AetherTrainerBase:
         step: int,
         instant_tps: float,
         ema_tps: float,
-        stats: ThroughputStats,
+        stats: ThroughputSnapshot,
         total_tok: int,
         chunk_hint: float,
     ):
