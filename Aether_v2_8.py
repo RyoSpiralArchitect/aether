@@ -2961,8 +2961,9 @@ class ThroughputMeter:
             samples=self._updates,
         )
 
-    def stats(self) -> Dict[str, float]:
-        return self.snapshot().as_dict()
+    def stats(self, as_dict: bool = True):
+        snap = self.snapshot()
+        return snap.as_dict() if as_dict else snap
 
     def reset(self):
         self.ready = False
