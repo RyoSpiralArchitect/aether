@@ -4620,7 +4620,7 @@ class AetherTrainerMPS(AetherTrainerBase):
                 t0 = time.time()
                 tps = float(total_tok) / max(1e-6, elapsed)
                 ema_tps = self._tps_meter.update(total_tok, elapsed)
-                tps_stats_obj = self._tps_meter.stats(as_dict=False)
+                tps_snapshot = self._tps_meter.stats(as_dict=False)
                 self._maybe_boost_throughput(ema_tps)
                 self._last_tok_per_sec = float(tps_snapshot.instant)
                 self._last_tok_per_sec_ema = float(ema_tps)
@@ -4639,8 +4639,8 @@ class AetherTrainerMPS(AetherTrainerBase):
                     else float(total_tok)
                 )
 
-                self._turbo_update(step, tps, ema_tps, tps_stats_obj, total_tok, chunk_hint)
-                tps_stats = tps_stats_obj.as_dict()
+                self._turbo_update(step, tps, ema_tps, tps_snapshot, total_tok, chunk_hint)
+                tps_stats = tps_snapshot.as_dict()
 
                 if self._adaptive_micro:
                     if self._micro_active > self._micro_base:
