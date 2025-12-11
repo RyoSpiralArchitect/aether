@@ -3583,6 +3583,7 @@ class AetherTrainerBase:
         self._ppl_cap = float(getattr(self.cfg, "ppl_cap", 0.0))
         clamp_hi = self._ppl_cap if self._ppl_cap > 0 else None
         self._loss_meter = EMAMeter(beta=ppl_beta, clamp=(0.0, clamp_hi))
+        self._skip_loss_meter_once = False
         self._loss_guard = float(getattr(self.cfg, "loss_guard", 0.0))
         self._tps_target = float(getattr(self.cfg, "tps_target", 0.0))
         self._tps_patience = max(1, int(getattr(self.cfg, "tps_boost_patience", 24)))
@@ -3953,6 +3954,13 @@ class AetherTrainerBase:
                     print("[LOSS] GradScaler reset after NaN loss")
                 except Exception:
                     pass
+            if hasattr(self, "_loss_meter"):
+                try:
+                    self._loss_meter.reset()
+                    print("[LOSS] EMA meter reset after non-finite loss")
+                except Exception:
+                    pass
+            self._skip_loss_meter_once = True
             loss_avg = guard if guard > 0 else 0.0
         if guard > 0 and loss_avg > guard:
             self._loss_spike_count += 1
@@ -3970,6 +3978,13 @@ class AetherTrainerBase:
                     print(reset_msg)
                 except Exception:
                     pass
+            if hasattr(self, "_loss_meter"):
+                try:
+                    self._loss_meter.reset()
+                    print("[LOSS] EMA meter reset after spike")
+                except Exception:
+                    pass
+            self._skip_loss_meter_once = True
             if repeated and getattr(self, "_adaptive_micro", False):
                 if self._micro_active < self._micro_cap:
                     prev = self._micro_active
@@ -4207,6 +4222,7 @@ class AetherTrainerMPS(AetherTrainerBase):
         self._loss_meter.reset()
         self._last_tok_per_sec = 0.0
         self._last_tok_per_sec_ema = 0.0
+        self._skip_loss_meter_once = False
 
         pad_id = self.tok.PAD
 
@@ -4611,7 +4627,11 @@ class AetherTrainerMPS(AetherTrainerBase):
                 raw_loss_avg = total_loss / max(1, total_tok)
                 loss_avg = self._stabilize_loss_value(raw_loss_avg)
                 loss_avg = max(0.0, loss_avg)
-                smooth_loss = self._loss_meter.update(loss_avg)
+                if getattr(self, "_skip_loss_meter_once", False):
+                    smooth_loss = loss_avg
+                    self._skip_loss_meter_once = False
+                else:
+                    smooth_loss = self._loss_meter.update(loss_avg)
                 ppl_base = smooth_loss
                 if self._ppl_cap > 0:
                     ppl_base = min(ppl_base, self._ppl_cap)
