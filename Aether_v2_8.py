@@ -419,7 +419,7 @@ import random
 import types
 import argparse
 from dataclasses import dataclass, field
-from typing import Optional, List, Tuple, Dict, Any, Union, Deque
+from typing import Optional, List, Tuple, Dict, Any, Union, Deque, Iterable
 from collections import deque
 
 try:
@@ -2405,6 +2405,27 @@ class StreamingTextDataset(IterableDataset):
 
     def __iter__(self):
         rng = random.Random(self.seed)
+        carry: List[int] = []
+
+        def _encode_text(text: str) -> List[int]:
+            if (
+                _KBRIDGE_AVAILABLE
+                and os.environ.get("KBRIDGE_PREPROC", "0") == "1"
+            ):
+                try:
+                    nbytes = byte_normalize_utf8(text)
+                    text = nbytes.decode("utf-8", errors="ignore")
+                except Exception:
+                    pass
+            return self.tok.encode(text)
+
+        def _drain_carry() -> Iterable[Tuple[List[int], List[int]]]:
+            nonlocal carry
+            while len(carry) > self.pack_len:
+                block = carry[: self.pack_len + 1]
+                carry = carry[self.pack_len :]
+                yield block, block
+
         while True:
             for f in self._files():
                 try:
@@ -2413,36 +2434,23 @@ class StreamingTextDataset(IterableDataset):
                         for line in fh:
                             buf += line
                             if len(buf) >= self.buffer_size:
-                                if (
-                                    _KBRIDGE_AVAILABLE
-                                    and os.environ.get("KBRIDGE_PREPROC", "0") == "1"
-                                ):
-                                    try:
-                                        nbytes = byte_normalize_utf8(buf)
-                                        buf = nbytes.decode("utf-8", errors="ignore")
-                                    except Exception:
-                                        pass
-                                ids = self.tok.encode(buf)
+                                ids = _encode_text(buf)
                                 buf = ""
-                                for s in range(0, max(1, len(ids) - 1), self.pack_len):
-                                    block = ids[s : s + self.pack_len]
-                                    yield block, block
+                                carry.extend(ids)
+                                for item in _drain_carry():
+                                    yield item
                         if buf:
-                            if (
-                                _KBRIDGE_AVAILABLE
-                                and os.environ.get("KBRIDGE_PREPROC", "0") == "1"
-                            ):
-                                try:
-                                    nbytes = byte_normalize_utf8(buf)
-                                    buf = nbytes.decode("utf-8", errors="ignore")
-                                except Exception:
-                                    pass
-                            ids = self.tok.encode(buf)
-                            for s in range(0, max(1, len(ids) - 1), self.pack_len):
-                                block = ids[s : s + self.pack_len]
-                                yield block, block
+                            ids = _encode_text(buf)
+                            carry.extend(ids)
+                            for item in _drain_carry():
+                                yield item
                 except Exception:
                     pass
+            if not self.infinite:
+                if len(carry) > 1:
+                    yield carry, carry
+                break
+            # Keep any short tail to seed the next epoch and avoid small padded batches
             if not self.infinite:
                 break
 
