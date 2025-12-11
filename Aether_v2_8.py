@@ -419,7 +419,7 @@ import random
 import types
 import argparse
 from dataclasses import dataclass, field
-from typing import Optional, List, Tuple, Dict, Any, Union, Deque
+from typing import Optional, List, Tuple, Dict, Any, Union, Deque, Iterable
 from collections import deque
 
 try:
@@ -2405,6 +2405,27 @@ class StreamingTextDataset(IterableDataset):
 
     def __iter__(self):
         rng = random.Random(self.seed)
+        carry: List[int] = []
+
+        def _encode_text(text: str) -> List[int]:
+            if (
+                _KBRIDGE_AVAILABLE
+                and os.environ.get("KBRIDGE_PREPROC", "0") == "1"
+            ):
+                try:
+                    nbytes = byte_normalize_utf8(text)
+                    text = nbytes.decode("utf-8", errors="ignore")
+                except Exception:
+                    pass
+            return self.tok.encode(text)
+
+        def _drain_carry() -> Iterable[Tuple[List[int], List[int]]]:
+            nonlocal carry
+            while len(carry) > self.pack_len:
+                block = carry[: self.pack_len + 1]
+                carry = carry[self.pack_len :]
+                yield block, block
+
         while True:
             for f in self._files():
                 try:
@@ -2413,36 +2434,23 @@ class StreamingTextDataset(IterableDataset):
                         for line in fh:
                             buf += line
                             if len(buf) >= self.buffer_size:
-                                if (
-                                    _KBRIDGE_AVAILABLE
-                                    and os.environ.get("KBRIDGE_PREPROC", "0") == "1"
-                                ):
-                                    try:
-                                        nbytes = byte_normalize_utf8(buf)
-                                        buf = nbytes.decode("utf-8", errors="ignore")
-                                    except Exception:
-                                        pass
-                                ids = self.tok.encode(buf)
+                                ids = _encode_text(buf)
                                 buf = ""
-                                for s in range(0, max(1, len(ids) - 1), self.pack_len):
-                                    block = ids[s : s + self.pack_len]
-                                    yield block, block
+                                carry.extend(ids)
+                                for item in _drain_carry():
+                                    yield item
                         if buf:
-                            if (
-                                _KBRIDGE_AVAILABLE
-                                and os.environ.get("KBRIDGE_PREPROC", "0") == "1"
-                            ):
-                                try:
-                                    nbytes = byte_normalize_utf8(buf)
-                                    buf = nbytes.decode("utf-8", errors="ignore")
-                                except Exception:
-                                    pass
-                            ids = self.tok.encode(buf)
-                            for s in range(0, max(1, len(ids) - 1), self.pack_len):
-                                block = ids[s : s + self.pack_len]
-                                yield block, block
+                            ids = _encode_text(buf)
+                            carry.extend(ids)
+                            for item in _drain_carry():
+                                yield item
                 except Exception:
                     pass
+            if not self.infinite:
+                if len(carry) > 1:
+                    yield carry, carry
+                break
+            # Keep any short tail to seed the next epoch and avoid small padded batches
             if not self.infinite:
                 break
 
@@ -2961,8 +2969,9 @@ class ThroughputMeter:
             samples=self._updates,
         )
 
-    def stats(self) -> Dict[str, float]:
-        return self.snapshot().as_dict()
+    def stats(self, as_dict: bool = True):
+        snap = self.snapshot()
+        return snap.as_dict() if as_dict else snap
 
     def reset(self):
         self.ready = False
@@ -3037,7 +3046,7 @@ class MPSTurboGovernor:
         step: int,
         instant_tps: float,
         ema_tps: float,
-        stats: ThroughputStats,
+        stats: ThroughputSnapshot,
         total_tok: int,
         chunk_hint: float,
     ):
@@ -3204,11 +3213,12 @@ class PsyAugment:
         B, T = x.shape
         x = x.clone()
         if self.token_dropout > 0:
-            mask = torch.rand_like(
-                x,
-                dtype=torch.float32,
-                generator=self._gen,
-            ) < self.token_dropout
+            if self._gen.device == x.device:
+                mask = torch.rand(
+                    x.shape, device=x.device, dtype=torch.float32, generator=self._gen
+                ) < self.token_dropout
+            else:
+                mask = torch.rand_like(x, dtype=torch.float32) < self.token_dropout
             x.masked_fill_(mask, pad_id)
         # byte_noise / span_mask は必要なら追加
         return x
@@ -3581,6 +3591,7 @@ class AetherTrainerBase:
         self._ppl_cap = float(getattr(self.cfg, "ppl_cap", 0.0))
         clamp_hi = self._ppl_cap if self._ppl_cap > 0 else None
         self._loss_meter = EMAMeter(beta=ppl_beta, clamp=(0.0, clamp_hi))
+        self._skip_loss_meter_once = False
         self._loss_guard = float(getattr(self.cfg, "loss_guard", 0.0))
         self._tps_target = float(getattr(self.cfg, "tps_target", 0.0))
         self._tps_patience = max(1, int(getattr(self.cfg, "tps_boost_patience", 24)))
@@ -3934,7 +3945,7 @@ class AetherTrainerBase:
         step: int,
         instant_tps: float,
         ema_tps: float,
-        stats: ThroughputStats,
+        stats: ThroughputSnapshot,
         total_tok: int,
         chunk_hint: float,
     ):
@@ -3951,6 +3962,13 @@ class AetherTrainerBase:
                     print("[LOSS] GradScaler reset after NaN loss")
                 except Exception:
                     pass
+            if hasattr(self, "_loss_meter"):
+                try:
+                    self._loss_meter.reset()
+                    print("[LOSS] EMA meter reset after non-finite loss")
+                except Exception:
+                    pass
+            self._skip_loss_meter_once = True
             loss_avg = guard if guard > 0 else 0.0
         if guard > 0 and loss_avg > guard:
             self._loss_spike_count += 1
@@ -3968,6 +3986,13 @@ class AetherTrainerBase:
                     print(reset_msg)
                 except Exception:
                     pass
+            if hasattr(self, "_loss_meter"):
+                try:
+                    self._loss_meter.reset()
+                    print("[LOSS] EMA meter reset after spike")
+                except Exception:
+                    pass
+            self._skip_loss_meter_once = True
             if repeated and getattr(self, "_adaptive_micro", False):
                 if self._micro_active < self._micro_cap:
                     prev = self._micro_active
@@ -4205,6 +4230,7 @@ class AetherTrainerMPS(AetherTrainerBase):
         self._loss_meter.reset()
         self._last_tok_per_sec = 0.0
         self._last_tok_per_sec_ema = 0.0
+        self._skip_loss_meter_once = False
 
         pad_id = self.tok.PAD
 
@@ -4609,7 +4635,11 @@ class AetherTrainerMPS(AetherTrainerBase):
                 raw_loss_avg = total_loss / max(1, total_tok)
                 loss_avg = self._stabilize_loss_value(raw_loss_avg)
                 loss_avg = max(0.0, loss_avg)
-                smooth_loss = self._loss_meter.update(loss_avg)
+                if getattr(self, "_skip_loss_meter_once", False):
+                    smooth_loss = loss_avg
+                    self._skip_loss_meter_once = False
+                else:
+                    smooth_loss = self._loss_meter.update(loss_avg)
                 ppl_base = smooth_loss
                 if self._ppl_cap > 0:
                     ppl_base = min(ppl_base, self._ppl_cap)
@@ -4618,7 +4648,7 @@ class AetherTrainerMPS(AetherTrainerBase):
                 t0 = time.time()
                 tps = float(total_tok) / max(1e-6, elapsed)
                 ema_tps = self._tps_meter.update(total_tok, elapsed)
-                tps_stats_obj = self._tps_meter.stats(as_dict=False)
+                tps_snapshot = self._tps_meter.stats(as_dict=False)
                 self._maybe_boost_throughput(ema_tps)
                 self._last_tok_per_sec = float(tps_snapshot.instant)
                 self._last_tok_per_sec_ema = float(ema_tps)
@@ -4637,8 +4667,8 @@ class AetherTrainerMPS(AetherTrainerBase):
                     else float(total_tok)
                 )
 
-                self._turbo_update(step, tps, ema_tps, tps_stats_obj, total_tok, chunk_hint)
-                tps_stats = tps_stats_obj.as_dict()
+                self._turbo_update(step, tps, ema_tps, tps_snapshot, total_tok, chunk_hint)
+                tps_stats = tps_snapshot.as_dict()
 
                 if self._adaptive_micro:
                     if self._micro_active > self._micro_base:
