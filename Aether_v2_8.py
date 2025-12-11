@@ -17,6 +17,7 @@
 
 import os as _aos
 import time as _atime
+import queue
 
 
 # ---------------------------
@@ -2384,6 +2385,7 @@ class StreamingTextDataset(IterableDataset):
         buffer_size: int = 8192,
         infinite: bool = True,
         seed: int = 1337,
+        prefetch_depth: int = 8,
     ):
         super().__init__()
         self.glob = glob_pat
@@ -2392,6 +2394,7 @@ class StreamingTextDataset(IterableDataset):
         self.buffer_size = buffer_size
         self.infinite = infinite
         self.seed = seed
+        self.prefetch_depth = max(1, prefetch_depth)
 
     def _files(self):
         # 再帰で拾う。0件なら即エラーで可視化（無限待ち防止）
@@ -2426,33 +2429,52 @@ class StreamingTextDataset(IterableDataset):
                 carry = carry[self.pack_len :]
                 yield block, block
 
+        def _iter_files():
+            files = self._files()
+            while True:
+                for f in files:
+                    yield f
+                if not self.infinite:
+                    break
+                rng.shuffle(files)
+
+        stop = object()
+        q: queue.Queue[List[int]] = queue.Queue(maxsize=self.prefetch_depth)
+
+        def _producer():
+            try:
+                for f in _iter_files():
+                    try:
+                        with open(f, "r", encoding="utf-8", errors="ignore") as fh:
+                            buf = ""
+                            for line in fh:
+                                buf += line
+                                if len(buf) >= self.buffer_size:
+                                    q.put(_encode_text(buf))
+                                    buf = ""
+                            if buf:
+                                q.put(_encode_text(buf))
+                    except Exception:
+                        pass
+                if not self.infinite:
+                    q.put(stop)
+            except Exception:
+                # Non-fatal; ensure consumer can exit if producer fails
+                q.put(stop)
+
+        t = threading.Thread(target=_producer, daemon=True)
+        t.start()
+
         while True:
-            for f in self._files():
-                try:
-                    with open(f, "r", encoding="utf-8", errors="ignore") as fh:
-                        buf = ""
-                        for line in fh:
-                            buf += line
-                            if len(buf) >= self.buffer_size:
-                                ids = _encode_text(buf)
-                                buf = ""
-                                carry.extend(ids)
-                                for item in _drain_carry():
-                                    yield item
-                        if buf:
-                            ids = _encode_text(buf)
-                            carry.extend(ids)
-                            for item in _drain_carry():
-                                yield item
-                except Exception:
-                    pass
-            if not self.infinite:
-                if len(carry) > 1:
-                    yield carry, carry
+            chunk = q.get()
+            if chunk is stop:
                 break
-            # Keep any short tail to seed the next epoch and avoid small padded batches
-            if not self.infinite:
-                break
+            carry.extend(chunk)
+            for item in _drain_carry():
+                yield item
+
+        if not self.infinite and len(carry) > 1:
+            yield carry, carry
 
 
 # ====== Trainer utils ========================================================
