@@ -2386,6 +2386,7 @@ class StreamingTextDataset(IterableDataset):
         infinite: bool = True,
         seed: int = 1337,
         prefetch_depth: int = 8,
+        token_workers: int = 2,
     ):
         super().__init__()
         self.glob = glob_pat
@@ -2395,6 +2396,7 @@ class StreamingTextDataset(IterableDataset):
         self.infinite = infinite
         self.seed = seed
         self.prefetch_depth = max(1, prefetch_depth)
+        self.token_workers = max(1, token_workers)
 
     def _files(self):
         # 再帰で拾う。0件なら即エラーで可視化（無限待ち防止）
@@ -2437,9 +2439,9 @@ class StreamingTextDataset(IterableDataset):
                 if not self.infinite:
                     break
                 rng.shuffle(files)
-
         stop = object()
-        q: queue.Queue[List[int]] = queue.Queue(maxsize=self.prefetch_depth)
+        raw_q: queue.Queue[str] = queue.Queue(maxsize=self.prefetch_depth * 2)
+        tok_q: queue.Queue[List[int]] = queue.Queue(maxsize=self.prefetch_depth)
 
         def _producer():
             try:
@@ -2450,25 +2452,46 @@ class StreamingTextDataset(IterableDataset):
                             for line in fh:
                                 buf += line
                                 if len(buf) >= self.buffer_size:
-                                    q.put(_encode_text(buf))
+                                    raw_q.put(buf)
                                     buf = ""
                             if buf:
-                                q.put(_encode_text(buf))
+                                raw_q.put(buf)
                     except Exception:
                         pass
                 if not self.infinite:
-                    q.put(stop)
+                    for _ in range(self.token_workers):
+                        raw_q.put(stop)
             except Exception:
-                # Non-fatal; ensure consumer can exit if producer fails
-                q.put(stop)
+                for _ in range(self.token_workers):
+                    raw_q.put(stop)
+
+        def _token_worker():
+            try:
+                while True:
+                    chunk = raw_q.get()
+                    if chunk is stop:
+                        raw_q.task_done()
+                        break
+                    tok_q.put(_encode_text(chunk))
+                    raw_q.task_done()
+            finally:
+                tok_q.put(stop)
+
+        producers = [threading.Thread(target=_token_worker, daemon=True) for _ in range(self.token_workers)]
+        for p in producers:
+            p.start()
 
         t = threading.Thread(target=_producer, daemon=True)
         t.start()
 
+        stop_seen = 0
         while True:
-            chunk = q.get()
+            chunk = tok_q.get()
             if chunk is stop:
-                break
+                stop_seen += 1
+                if stop_seen >= self.token_workers:
+                    break
+                continue
             carry.extend(chunk)
             for item in _drain_carry():
                 yield item
