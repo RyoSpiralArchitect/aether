@@ -329,11 +329,11 @@ if _aos.environ.get("AETHER_BACKWARD_GUARD_DISABLED", "0") != "1":
 # ---------------------------------------------------------
 # 3) Light Paged-Attention wrapper for inference-time SDPA
 # ---------------------------------------------------------
-_AETHER_SDPA_ORIG = None
-_AETHER_SDPA_WINDOW = int(_aos.environ.get("AETHER_SDPA_WINDOW", "0"))
+_AETHER_INF_SDPA_ORIG = None
+_AETHER_INF_SDPA_WINDOW = int(_aos.environ.get("AETHER_SDPA_WINDOW", "0"))
 
 
-def enable_tiled_sdpa(
+def enable_inference_sdpa(
     tiled_q: int = 0,
     tiled_k: int = 0,
     compute_in_fp32: bool = True,
@@ -347,22 +347,22 @@ def enable_tiled_sdpa(
 
     tiled_q/tiled_k are accepted for API compatibility (no-ops here).
     """
-    global _AETHER_SDPA_ORIG, _AETHER_SDPA_WINDOW
+    global _AETHER_INF_SDPA_ORIG, _AETHER_INF_SDPA_WINDOW
     try:
         import torch.nn.functional as F
     except Exception:
         return
 
     if window_size is not None:
-        _AETHER_SDPA_WINDOW = int(window_size)
+        _AETHER_INF_SDPA_WINDOW = int(window_size)
 
-    if _AETHER_SDPA_ORIG is None:
-        _AETHER_SDPA_ORIG = F.scaled_dot_product_attention
+    if _AETHER_INF_SDPA_ORIG is None:
+        _AETHER_INF_SDPA_ORIG = F.scaled_dot_product_attention
 
     def _sdpa_wrapper(
         q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None
     ):
-        w = _AETHER_SDPA_WINDOW
+        w = _AETHER_INF_SDPA_WINDOW
         # If generating (q_len==1) and window enabled, crop tail window
         if w and q.size(-2) == 1 and k.size(-2) > w:
             k = k[..., -w:, :]
@@ -371,7 +371,7 @@ def enable_tiled_sdpa(
                 attn_mask = attn_mask[..., -w:]
         if compute_in_fp32:
             qf, kf, vf = q.float(), k.float(), v.float()
-            out = _AETHER_SDPA_ORIG(
+            out = _AETHER_INF_SDPA_ORIG(
                 qf,
                 kf,
                 vf,
@@ -382,7 +382,7 @@ def enable_tiled_sdpa(
             )
             return out.to(q.dtype)
         else:
-            return _AETHER_SDPA_ORIG(
+            return _AETHER_INF_SDPA_ORIG(
                 q,
                 k,
                 v,
@@ -394,20 +394,20 @@ def enable_tiled_sdpa(
 
     F.scaled_dot_product_attention = _sdpa_wrapper
     print(
-        f"[SDPA] wrapper enabled (window={_AETHER_SDPA_WINDOW}, fp32={compute_in_fp32})"
+        f"[SDPA] inference wrapper enabled (window={_AETHER_INF_SDPA_WINDOW}, fp32={compute_in_fp32})"
     )
     
-def disable_tiled_sdpa():
+def disable_inference_sdpa():
     """Restore the original SDPA implementation."""
-    global _AETHER_SDPA_ORIG
+    global _AETHER_INF_SDPA_ORIG
     try:
         import torch.nn.functional as F
 
-        if _AETHER_SDPA_ORIG is not None:
-            F.scaled_dot_product_attention = _AETHER_SDPA_ORIG
-            print("[SDPA] wrapper disabled")
+        if _AETHER_INF_SDPA_ORIG is not None:
+            F.scaled_dot_product_attention = _AETHER_INF_SDPA_ORIG
+            print("[SDPA] inference wrapper disabled")
     finally:
-        _AETHER_SDPA_ORIG = None
+        _AETHER_INF_SDPA_ORIG = None
 
 import os
 import sys
@@ -833,6 +833,8 @@ class _AetherNumpyAIController:
     def __init__(self, trainer):
         self.tr = trainer
         self.enabled = bool(int(os.environ.get("AETHER_AI_ENABLE", "0")))
+        self.mode = os.environ.get("AETHER_AI_MODE", "diagnostic").strip().lower()
+        self.active = self.enabled and self.mode in {"active", "act"}
         self.ucb_c = float(os.environ.get("AETHER_AI_UCB_C", "1.25"))
         self.min_ls = float(
             os.environ.get(
@@ -913,9 +915,9 @@ class _AetherNumpyAIController:
         # LR bridge
         self._lr_base = None
 
-        if self.enabled and self.safe_softmax_default:
+        if self.active and self.safe_softmax_default:
             self._patch_softmax(True)
-        if self.enabled and self.sanitize_opt_default:
+        if self.active and self.sanitize_opt_default:
             self._sanitize_optimizer_states_safe()
 
     # ---------- patches ----------
@@ -1031,7 +1033,7 @@ class _AetherNumpyAIController:
         return 0.2
 
     def decide_and_act(self, step_idx: int):
-        if not self.enabled:
+        if not self.active:
             return
         # hazard = too many non-finite in tail or weird zero loss
         hazard = False
@@ -1084,7 +1086,7 @@ class _AetherNumpyAIController:
 
     # called by loop to check skip
     def should_skip(self):
-        if self.skip_next_step:
+        if self.active and self.skip_next_step:
             self.skip_next_step = False
             return True
         return False
@@ -1121,20 +1123,22 @@ class _AetherNumpyAIController:
         if Lmax > 75.0:  # conservative threshold for saturation risk
             self.set_flag("fp32_logits", True)
             out["hazard"] = True
-            if self.allow_skip:
+            if self.active and self.allow_skip:
                 self.skip_next_step = True
         try:
             if suby is not None and pad_id is not None:
                 mask = suby != pad_id
                 if int(mask.sum().item()) <= 1:
                     out["hazard"] = True
-                    if self.allow_skip:
+                    if self.active and self.allow_skip:
                         self.skip_next_step = True
         except Exception:
             pass
         return out
 
     def sanitize_gradients(self, model):
+        if not self.active:
+            return
         # Nan->num for grads; light clamp to avoid wild spikes.
         try:
             for p in model.parameters():
@@ -2516,6 +2520,13 @@ class TrainConfig:
     micro_batch: int = 1
     lr: float = 2e-4
     warmup_steps: int = 300
+    lr_hold_steps: int = 64
+    lr_min_mult: float = 0.10
+    lr_plateau_patience: int = 64
+    lr_plateau_delta: float = 0.005
+    lr_plateau_factor: float = 0.85
+    lr_plateau_min_mult: float = 0.25
+    lr_plateau_cooldown: int = 32
     grad_clip: Optional[float] = 1.0
     max_len: int = 2048
     out_dir: str = "runs/v28"
@@ -3206,19 +3217,69 @@ class ChronoScheduler:
         self.step_id = 0
         self.base_lr = cfg.lr
         self.warm = cfg.warmup_steps
+        self.hold = int(getattr(cfg, "lr_hold_steps", 0) or 0)
+        self.min_mult = float(getattr(cfg, "lr_min_mult", 0.0) or 0.0)
+        self.plateau_patience = int(getattr(cfg, "lr_plateau_patience", 0) or 0)
+        self.plateau_delta = float(getattr(cfg, "lr_plateau_delta", 0.0) or 0.0)
+        self.plateau_factor = float(getattr(cfg, "lr_plateau_factor", 1.0) or 1.0)
+        self.plateau_min_mult = float(
+            getattr(cfg, "lr_plateau_min_mult", 0.0) or 0.0
+        )
+        self.plateau_cooldown = int(getattr(cfg, "lr_plateau_cooldown", 0) or 0)
+        self._adaptive_mult = 1.0
+        self._best_loss = None
+        self._plateau_count = 0
+        self._last_plateau_step = -10**9
 
     def _setlr(self, mult: float):
         for g in self.opt.param_groups:
             g["lr"] = self.base_lr * mult
+
+    def update_metrics(self, loss: Optional[float] = None):
+        if self.plateau_patience <= 0 or loss is None:
+            return
+        if not math.isfinite(loss):
+            return
+        if self._best_loss is None:
+            self._best_loss = float(loss)
+            return
+        delta = float(self.plateau_delta)
+        improved = float(loss) < (self._best_loss - delta)
+        if improved:
+            self._best_loss = float(loss)
+            self._plateau_count = 0
+            return
+        self._plateau_count += 1
+        if self._plateau_count < self.plateau_patience:
+            return
+        if (self.step_id - self._last_plateau_step) < self.plateau_cooldown:
+            return
+        self._plateau_count = 0
+        self._last_plateau_step = self.step_id
+        if self.plateau_factor < 1.0:
+            prev = self._adaptive_mult
+            self._adaptive_mult = max(
+                self.plateau_min_mult, self._adaptive_mult * self.plateau_factor
+            )
+            if self._adaptive_mult < prev:
+                print(
+                    f"[SCHED] plateau backoff: mult {prev:.4f} → {self._adaptive_mult:.4f}"
+                )
 
     def step(self):
         self.step_id += 1
         s = self.step_id
         if s <= self.warm:
             m = s / max(1, self.warm)
+        elif s <= (self.warm + self.hold):
+            m = 1.0
         else:
-            t = (s - self.warm) / max(1, self.total - self.warm)
-            m = 0.5 * (1 + math.cos(math.pi * t))
+            decay_span = max(1, self.total - self.warm - self.hold)
+            t = (s - self.warm - self.hold) / decay_span
+            t = min(max(t, 0.0), 1.0)
+            cosine = 0.5 * (1 + math.cos(math.pi * t))
+            m = max(0.0, self.min_mult) + (1.0 - max(0.0, self.min_mult)) * cosine
+        m = max(0.0, m) * max(0.0, self._adaptive_mult)
         self._setlr(m)
         return m
 
@@ -3232,6 +3293,13 @@ class PsyAugment:
         self.span_mask_prob = 0.0
         self.span_len = 8
         self._gen = torch.Generator(device="cpu")
+        self._noise_low = 3
+        self._noise_high = int(getattr(tok, "vocab_size", 0) or 0)
+        byte_base = getattr(tok, "_byte_base", None)
+        byte_fallback = bool(getattr(tok, "_byte_fallback", False))
+        if byte_fallback and isinstance(byte_base, int) and byte_base >= 0:
+            self._noise_low = byte_base
+            self._noise_high = byte_base + 256
         seed_env = _aos.environ.get("AETHER_PSY_SEED")
         try:
             if seed_env is not None:
@@ -3265,7 +3333,71 @@ class PsyAugment:
             else:
                 mask = torch.rand_like(x, dtype=torch.float32) < self.token_dropout
             x.masked_fill_(mask, pad_id)
-        # byte_noise / span_mask は必要なら追加
+        if self.byte_noise > 0 and self._noise_high > self._noise_low:
+            if self._gen.device == x.device:
+                noise_mask = torch.rand(
+                    x.shape, device=x.device, dtype=torch.float32, generator=self._gen
+                ) < self.byte_noise
+            else:
+                noise_mask = torch.rand_like(x, dtype=torch.float32) < self.byte_noise
+            if noise_mask.any():
+                if self._gen.device == x.device:
+                    noise_vals = torch.randint(
+                        self._noise_low,
+                        self._noise_high,
+                        x.shape,
+                        device=x.device,
+                        dtype=x.dtype,
+                        generator=self._gen,
+                    )
+                else:
+                    noise_vals = torch.randint(
+                        self._noise_low,
+                        self._noise_high,
+                        x.shape,
+                        device=x.device,
+                        dtype=x.dtype,
+                    )
+                x = torch.where(noise_mask, noise_vals, x)
+        if self.span_mask_prob > 0 and self.span_len > 0:
+            span_len = max(1, int(self.span_len))
+            for b in range(B):
+                if self._gen.device == x.device:
+                    starts = torch.rand(
+                        (T,),
+                        device=x.device,
+                        dtype=torch.float32,
+                        generator=self._gen,
+                    ) < self.span_mask_prob
+                else:
+                    starts = torch.rand(
+                        (T,), device=x.device, dtype=torch.float32
+                    ) < self.span_mask_prob
+                if not starts.any():
+                    continue
+                start_idx = starts.nonzero(as_tuple=False).view(-1)
+                for s in start_idx.tolist():
+                    if self._gen.device == x.device:
+                        span_jitter = int(
+                            torch.randint(
+                                max(1, span_len // 2),
+                                max(2, span_len * 2),
+                                (1,),
+                                device=x.device,
+                                generator=self._gen,
+                            ).item()
+                        )
+                    else:
+                        span_jitter = int(
+                            torch.randint(
+                                max(1, span_len // 2),
+                                max(2, span_len * 2),
+                                (1,),
+                                device=x.device,
+                            ).item()
+                        )
+                    end = min(T, s + span_jitter)
+                    x[b, s:end] = pad_id
         return x
 
 
@@ -3871,6 +4003,8 @@ class AetherTrainerBase:
             self._kb_buf_predcls = []
             self._kb_buf_truecls = []
             self._kb_buf_lenbin = []
+            self._kb_buf_entropy = []
+            self._kb_buf_margin = []
             # sequence-level NDCG buffer
             self._kb_seq_scores = []
             self._kb_seq_gains = []
@@ -3899,6 +4033,8 @@ class AetherTrainerBase:
             self._kb_buf_predcls = []
             self._kb_buf_truecls = []
             self._kb_buf_lenbin = []
+            self._kb_buf_entropy = []
+            self._kb_buf_margin = []
             self._kb_seq_scores = []
             self._kb_seq_gains = []
             self._kb_class_scheme = os.environ.get("KBRIDGE_CLASSMAP", "byte-basic").strip().lower()
@@ -3906,6 +4042,7 @@ class AetherTrainerBase:
             self._kb_classmap = None
             self._kb_group_names = []
             self._kb_group_count = 0
+        self._kb_len_warned = False
         # 2D ECE（len×class）や T sweep/quantile bins
         self._kb_enable_2d = bool(int(os.environ.get("KBRIDGE_ECE_2D", "0")))
         self._kb_2d_max_cells = int(os.environ.get("KBRIDGE_2D_MAX_CELLS", "24"))
@@ -4271,6 +4408,7 @@ class AetherTrainerMPS(AetherTrainerBase):
             steps_per_epoch = self.cfg.max_steps or 10**9
         total_steps = self.cfg.max_steps or int(self.cfg.epochs * steps_per_epoch)
         sched = ChronoScheduler(self.opt, self.cfg, total_steps=total_steps)
+        self.sched = sched
         self._tps_meter.reset()
         self._loss_meter.reset()
         self._last_tok_per_sec = 0.0
@@ -4545,6 +4683,10 @@ class AetherTrainerMPS(AetherTrainerBase):
                                 loss = self._sanitize_loss_value(
                                     loss, "loss_scaled", step
                                 )
+                                ani = getattr(self, "_ani_manager", None)
+                                scale = getattr(ani, "loss_scale", 1.0) if ani else 1.0
+                                if isinstance(scale, (int, float)) and abs(scale - 1.0) > 1e-6:
+                                    loss = loss * float(scale)
                         except RuntimeError as e:
                             if self._maybe_handle_oom(e, B):
                                 restart_batch = True
@@ -4689,6 +4831,7 @@ class AetherTrainerMPS(AetherTrainerBase):
                 if self._ppl_cap > 0:
                     ppl_base = min(ppl_base, self._ppl_cap)
                 ppl = math.exp(ppl_base)
+                sched.update_metrics(smooth_loss)
                 elapsed = time.time() - t0
                 t0 = time.time()
                 tps = float(total_tok) / max(1e-6, elapsed)
@@ -4752,6 +4895,9 @@ class AetherTrainerMPS(AetherTrainerBase):
                             pmax = p.amax(dim=-1)  # (B,T)
                             pred = p.argmax(dim=-1)  # (B,T)
                             correct = (pred == suby).float()  # (B,T)
+                            top2 = p.topk(2, dim=-1).values
+                            margin = (top2[..., 0] - top2[..., 1]).clamp(min=0.0)
+                            entropy = -(p * (p.clamp_min(1e-12).log())).sum(dim=-1)
                             mask = suby != pad_id
                             # to CPU np
                             pm = (
@@ -4781,6 +4927,20 @@ class AetherTrainerMPS(AetherTrainerBase):
                                 .cpu()
                                 .numpy()
                                 .astype("int32", copy=False)
+                            )
+                            ent = (
+                                entropy[mask]
+                                .detach()
+                                .cpu()
+                                .numpy()
+                                .astype("float64", copy=False)
+                            )
+                            mar = (
+                                margin[mask]
+                                .detach()
+                                .cpu()
+                                .numpy()
+                                .astype("float64", copy=False)
                             )
                             # length-bin per token
                             np_mod = _require_numpy(
@@ -4819,6 +4979,8 @@ class AetherTrainerMPS(AetherTrainerBase):
                             self._kb_buf_predcls.append(pr)
                             self._kb_buf_truecls.append(tr)
                             self._kb_buf_lenbin.append(lbins)
+                            self._kb_buf_entropy.append(ent)
+                            self._kb_buf_margin.append(mar)
                             # store groups
                             self._kb_buf_predgrp = getattr(self, "_kb_buf_predgrp", [])
                             self._kb_buf_truegrp = getattr(self, "_kb_buf_truegrp", [])
@@ -4841,6 +5003,8 @@ class AetherTrainerMPS(AetherTrainerBase):
                                     self._kb_buf_predcls = self._kb_buf_predcls[start:]
                                     self._kb_buf_truecls = self._kb_buf_truecls[start:]
                                     self._kb_buf_lenbin = self._kb_buf_lenbin[start:]
+                                    self._kb_buf_entropy = self._kb_buf_entropy[start:]
+                                    self._kb_buf_margin = self._kb_buf_margin[start:]
                                     self._kb_buf_predgrp = self._kb_buf_predgrp[start:]
                                     self._kb_buf_truegrp = self._kb_buf_truegrp[start:]
                     except Exception:
@@ -4997,6 +5161,16 @@ class AetherTrainerMPS(AetherTrainerBase):
                                 if self._kb_buf_lenbin
                                 else np_mod.zeros((0,), dtype=np_mod.int32)
                             )
+                            ent = (
+                                np_mod.concatenate(self._kb_buf_entropy, axis=0)
+                                if self._kb_buf_entropy
+                                else np_mod.zeros((0,), dtype=np_mod.float64)
+                            )
+                            mar = (
+                                np_mod.concatenate(self._kb_buf_margin, axis=0)
+                                if self._kb_buf_margin
+                                else np_mod.zeros((0,), dtype=np_mod.float64)
+                            )
                             prg = (
                                 np_mod.concatenate(
                                     getattr(self, "_kb_buf_predgrp", []), axis=0
@@ -5011,11 +5185,48 @@ class AetherTrainerMPS(AetherTrainerBase):
                                 if getattr(self, "_kb_buf_truegrp", None)
                                 else np_mod.zeros((0,), dtype=np_mod.int32)
                             )
+                            sizes = [
+                                int(pm.size),
+                                int(lb.size),
+                                int(pr.size),
+                                int(tr.size),
+                                int(ln.size),
+                                int(prg.size),
+                                int(trg.size),
+                                int(ent.size),
+                                int(mar.size),
+                            ]
+                            nonzero = [s for s in sizes if s > 0]
+                            if nonzero:
+                                N = min(nonzero)
+                                if any(s != N for s in sizes if s > 0):
+                                    if not getattr(self, "_kb_len_warned", False):
+                                        print(
+                                            "[KBRIDGE] buffer length mismatch; trimming to",
+                                            N,
+                                            sizes,
+                                        )
+                                        self._kb_len_warned = True
+                                    pm = pm[:N]
+                                    lb = lb[:N]
+                                    pr = pr[:N]
+                                    tr = tr[:N]
+                                    ln = ln[:N]
+                                    prg = prg[:N]
+                                    trg = trg[:N]
+                                    ent = ent[:N]
+                                    mar = mar[:N]
+                            if pm.size == 0 or lb.size == 0:
+                                raise ValueError("empty K-bridge buffers after trimming")
                             # overall ECE + hist（等幅）
                             ece, counts, mconf, macc = ece_and_hist_k(
                                 pm, lb, n_bins=max(2, self._kb_ece_bins)
                             )
                             logs = {"eval/ece_top": float(ece)}
+                            if ent.size > 0:
+                                logs["eval/entropy_mean"] = float(ent.mean())
+                            if mar.size > 0:
+                                logs["eval/margin_mean"] = float(mar.mean())
                             for i, ct in enumerate(counts.tolist()[:10]):
                                 logs[f"eval/conf_hist/bin{i}"] = float(ct)
                                 logs[f"eval/conf_bin_mean/conf{i}"] = float(mconf[i])
@@ -5677,6 +5888,13 @@ def __aether_main__():
     ap.add_argument("--micro_batch", type=int, default=8)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--warmup", type=int, default=300)
+    ap.add_argument("--lr_hold", type=int, default=64)
+    ap.add_argument("--lr_min_mult", type=float, default=0.10)
+    ap.add_argument("--lr_plateau_patience", type=int, default=64)
+    ap.add_argument("--lr_plateau_delta", type=float, default=0.005)
+    ap.add_argument("--lr_plateau_factor", type=float, default=0.85)
+    ap.add_argument("--lr_plateau_min_mult", type=float, default=0.25)
+    ap.add_argument("--lr_plateau_cooldown", type=int, default=32)
     ap.add_argument("--out_dir", type=str, default="runs/v28")
     ap.add_argument("--tiled_q", type=int, default=192)
     ap.add_argument("--tiled_k", type=int, default=320)
@@ -5906,6 +6124,13 @@ def __aether_main__():
         micro_batch=args.micro_batch,
         lr=args.lr,
         warmup_steps=args.warmup,
+        lr_hold_steps=int(args.lr_hold),
+        lr_min_mult=float(args.lr_min_mult),
+        lr_plateau_patience=int(args.lr_plateau_patience),
+        lr_plateau_delta=float(args.lr_plateau_delta),
+        lr_plateau_factor=float(args.lr_plateau_factor),
+        lr_plateau_min_mult=float(args.lr_plateau_min_mult),
+        lr_plateau_cooldown=int(args.lr_plateau_cooldown),
         grad_clip=1.0,
         max_len=args.max_len,
         out_dir=args.out_dir,
@@ -6573,31 +6798,6 @@ def _install_nan_guard_and_ani_from_env(trainer):
             trainer._make_loader = _types.MethodType(_patched_make_loader, trainer)
         except Exception:
             pass
-        # global backward patch for loss scaling (scales loss before backward)
-        try:
-            _orig_backward = torch.Tensor.backward
-
-            def _patched_backward(
-                self, gradient=None, retain_graph=False, create_graph=False, inputs=None
-            ):
-                scale = (
-                    getattr(trainer._ani_manager, "loss_scale", 1.0)
-                    if getattr(trainer, "_ani_manager", None)
-                    else 1.0
-                )
-                if isinstance(scale, (int, float)) and abs(scale - 1.0) > 1e-6:
-                    self = self * float(scale)
-                return _orig_backward(
-                    self,
-                    gradient=gradient,
-                    retain_graph=retain_graph,
-                    create_graph=create_graph,
-                    inputs=inputs,
-                )
-
-            torch.Tensor.backward = _patched_backward
-        except Exception:
-            pass
 
 
 # Inject installer call inside __aether_main__ dynamically by patching the function body at runtime is complex.
@@ -6683,12 +6883,12 @@ def _sg_cfg_from_env() -> Dict[str, Any]:
         "grad_max": _sg_env_f("AETHER_GUARDIAN_GRAD_MAX", 50.0),
         "grad_sample": _sg_env_i("AETHER_GUARDIAN_GRAD_SAMPLES", 128),  # 0=全件
         # staged actions
-        "lr_backoff": _sg_env_f("AETHER_GUARDIAN_LR_BACKOFF", 0.5),
-        "scale_backoff": _sg_env_f("AETHER_GUARDIAN_SCALE_BACKOFF", 0.5),
+        "lr_backoff": _sg_env_f("AETHER_GUARDIAN_LR_BACKOFF", 1.0),
+        "scale_backoff": _sg_env_f("AETHER_GUARDIAN_SCALE_BACKOFF", 1.0),
         "scale_min": _sg_env_f("AETHER_GUARDIAN_SCALE_MIN", 0.015625),
-        "clip_on": _sg_env_b("AETHER_GUARDIAN_CLIP_ON", 1),
+        "clip_on": _sg_env_b("AETHER_GUARDIAN_CLIP_ON", 0),
         "clip_value": _sg_env_f("AETHER_GUARDIAN_CLIP", 1.0),
-        "skip_on": _sg_env_b("AETHER_GUARDIAN_SKIP", 1),
+        "skip_on": _sg_env_b("AETHER_GUARDIAN_SKIP", 0),
         "max_level": _sg_env_i("AETHER_GUARDIAN_MAX_LEVEL", 3),
         "patience": _sg_env_i("AETHER_GUARDIAN_PATIENCE", 1),  # 何件で次レベル
         "stop_after": _sg_env_i("AETHER_GUARDIAN_STOP_AFTER", 8),
@@ -6842,20 +7042,6 @@ class SpiralGuardian:
         self.level = min(int(self.cfg["max_level"]), self.level + 1)
         if self.cfg["verbose"]:
             print(f"[GUARD] ESCALATE → L{self.level} ({reason})")
-        # staged actions
-        self._apply_lr_backoff()
-        self._apply_scale_backoff()
-        if self.cfg["clip_on"]:
-            try:
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), float(self.cfg["clip_value"])
-                )
-            except Exception:
-                pass
-        if self.cfg["skip_on"]:
-            self._skip_budget = max(
-                self._skip_budget, 1
-            )  # skip next step at least once
         # snapshot on every escalation
         self._snapshot(reason=f"escalate_L{self.level}")
 
