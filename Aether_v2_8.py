@@ -833,6 +833,8 @@ class _AetherNumpyAIController:
     def __init__(self, trainer):
         self.tr = trainer
         self.enabled = bool(int(os.environ.get("AETHER_AI_ENABLE", "0")))
+        self.mode = os.environ.get("AETHER_AI_MODE", "diagnostic").strip().lower()
+        self.active = self.enabled and self.mode in {"active", "act"}
         self.ucb_c = float(os.environ.get("AETHER_AI_UCB_C", "1.25"))
         self.min_ls = float(
             os.environ.get(
@@ -913,9 +915,9 @@ class _AetherNumpyAIController:
         # LR bridge
         self._lr_base = None
 
-        if self.enabled and self.safe_softmax_default:
+        if self.active and self.safe_softmax_default:
             self._patch_softmax(True)
-        if self.enabled and self.sanitize_opt_default:
+        if self.active and self.sanitize_opt_default:
             self._sanitize_optimizer_states_safe()
 
     # ---------- patches ----------
@@ -1031,7 +1033,7 @@ class _AetherNumpyAIController:
         return 0.2
 
     def decide_and_act(self, step_idx: int):
-        if not self.enabled:
+        if not self.active:
             return
         # hazard = too many non-finite in tail or weird zero loss
         hazard = False
@@ -1084,7 +1086,7 @@ class _AetherNumpyAIController:
 
     # called by loop to check skip
     def should_skip(self):
-        if self.skip_next_step:
+        if self.active and self.skip_next_step:
             self.skip_next_step = False
             return True
         return False
@@ -1121,20 +1123,22 @@ class _AetherNumpyAIController:
         if Lmax > 75.0:  # conservative threshold for saturation risk
             self.set_flag("fp32_logits", True)
             out["hazard"] = True
-            if self.allow_skip:
+            if self.active and self.allow_skip:
                 self.skip_next_step = True
         try:
             if suby is not None and pad_id is not None:
                 mask = suby != pad_id
                 if int(mask.sum().item()) <= 1:
                     out["hazard"] = True
-                    if self.allow_skip:
+                    if self.active and self.allow_skip:
                         self.skip_next_step = True
         except Exception:
             pass
         return out
 
     def sanitize_gradients(self, model):
+        if not self.active:
+            return
         # Nan->num for grads; light clamp to avoid wild spikes.
         try:
             for p in model.parameters():
@@ -3999,6 +4003,8 @@ class AetherTrainerBase:
             self._kb_buf_predcls = []
             self._kb_buf_truecls = []
             self._kb_buf_lenbin = []
+            self._kb_buf_entropy = []
+            self._kb_buf_margin = []
             # sequence-level NDCG buffer
             self._kb_seq_scores = []
             self._kb_seq_gains = []
@@ -4027,6 +4033,8 @@ class AetherTrainerBase:
             self._kb_buf_predcls = []
             self._kb_buf_truecls = []
             self._kb_buf_lenbin = []
+            self._kb_buf_entropy = []
+            self._kb_buf_margin = []
             self._kb_seq_scores = []
             self._kb_seq_gains = []
             self._kb_class_scheme = os.environ.get("KBRIDGE_CLASSMAP", "byte-basic").strip().lower()
@@ -4034,6 +4042,7 @@ class AetherTrainerBase:
             self._kb_classmap = None
             self._kb_group_names = []
             self._kb_group_count = 0
+        self._kb_len_warned = False
         # 2D ECE（len×class）や T sweep/quantile bins
         self._kb_enable_2d = bool(int(os.environ.get("KBRIDGE_ECE_2D", "0")))
         self._kb_2d_max_cells = int(os.environ.get("KBRIDGE_2D_MAX_CELLS", "24"))
@@ -4674,6 +4683,10 @@ class AetherTrainerMPS(AetherTrainerBase):
                                 loss = self._sanitize_loss_value(
                                     loss, "loss_scaled", step
                                 )
+                                ani = getattr(self, "_ani_manager", None)
+                                scale = getattr(ani, "loss_scale", 1.0) if ani else 1.0
+                                if isinstance(scale, (int, float)) and abs(scale - 1.0) > 1e-6:
+                                    loss = loss * float(scale)
                         except RuntimeError as e:
                             if self._maybe_handle_oom(e, B):
                                 restart_batch = True
@@ -4882,6 +4895,9 @@ class AetherTrainerMPS(AetherTrainerBase):
                             pmax = p.amax(dim=-1)  # (B,T)
                             pred = p.argmax(dim=-1)  # (B,T)
                             correct = (pred == suby).float()  # (B,T)
+                            top2 = p.topk(2, dim=-1).values
+                            margin = (top2[..., 0] - top2[..., 1]).clamp(min=0.0)
+                            entropy = -(p * (p.clamp_min(1e-12).log())).sum(dim=-1)
                             mask = suby != pad_id
                             # to CPU np
                             pm = (
@@ -4911,6 +4927,20 @@ class AetherTrainerMPS(AetherTrainerBase):
                                 .cpu()
                                 .numpy()
                                 .astype("int32", copy=False)
+                            )
+                            ent = (
+                                entropy[mask]
+                                .detach()
+                                .cpu()
+                                .numpy()
+                                .astype("float64", copy=False)
+                            )
+                            mar = (
+                                margin[mask]
+                                .detach()
+                                .cpu()
+                                .numpy()
+                                .astype("float64", copy=False)
                             )
                             # length-bin per token
                             np_mod = _require_numpy(
@@ -4949,6 +4979,8 @@ class AetherTrainerMPS(AetherTrainerBase):
                             self._kb_buf_predcls.append(pr)
                             self._kb_buf_truecls.append(tr)
                             self._kb_buf_lenbin.append(lbins)
+                            self._kb_buf_entropy.append(ent)
+                            self._kb_buf_margin.append(mar)
                             # store groups
                             self._kb_buf_predgrp = getattr(self, "_kb_buf_predgrp", [])
                             self._kb_buf_truegrp = getattr(self, "_kb_buf_truegrp", [])
@@ -4971,6 +5003,8 @@ class AetherTrainerMPS(AetherTrainerBase):
                                     self._kb_buf_predcls = self._kb_buf_predcls[start:]
                                     self._kb_buf_truecls = self._kb_buf_truecls[start:]
                                     self._kb_buf_lenbin = self._kb_buf_lenbin[start:]
+                                    self._kb_buf_entropy = self._kb_buf_entropy[start:]
+                                    self._kb_buf_margin = self._kb_buf_margin[start:]
                                     self._kb_buf_predgrp = self._kb_buf_predgrp[start:]
                                     self._kb_buf_truegrp = self._kb_buf_truegrp[start:]
                     except Exception:
@@ -5127,6 +5161,16 @@ class AetherTrainerMPS(AetherTrainerBase):
                                 if self._kb_buf_lenbin
                                 else np_mod.zeros((0,), dtype=np_mod.int32)
                             )
+                            ent = (
+                                np_mod.concatenate(self._kb_buf_entropy, axis=0)
+                                if self._kb_buf_entropy
+                                else np_mod.zeros((0,), dtype=np_mod.float64)
+                            )
+                            mar = (
+                                np_mod.concatenate(self._kb_buf_margin, axis=0)
+                                if self._kb_buf_margin
+                                else np_mod.zeros((0,), dtype=np_mod.float64)
+                            )
                             prg = (
                                 np_mod.concatenate(
                                     getattr(self, "_kb_buf_predgrp", []), axis=0
@@ -5141,11 +5185,48 @@ class AetherTrainerMPS(AetherTrainerBase):
                                 if getattr(self, "_kb_buf_truegrp", None)
                                 else np_mod.zeros((0,), dtype=np_mod.int32)
                             )
+                            sizes = [
+                                int(pm.size),
+                                int(lb.size),
+                                int(pr.size),
+                                int(tr.size),
+                                int(ln.size),
+                                int(prg.size),
+                                int(trg.size),
+                                int(ent.size),
+                                int(mar.size),
+                            ]
+                            nonzero = [s for s in sizes if s > 0]
+                            if nonzero:
+                                N = min(nonzero)
+                                if any(s != N for s in sizes if s > 0):
+                                    if not getattr(self, "_kb_len_warned", False):
+                                        print(
+                                            "[KBRIDGE] buffer length mismatch; trimming to",
+                                            N,
+                                            sizes,
+                                        )
+                                        self._kb_len_warned = True
+                                    pm = pm[:N]
+                                    lb = lb[:N]
+                                    pr = pr[:N]
+                                    tr = tr[:N]
+                                    ln = ln[:N]
+                                    prg = prg[:N]
+                                    trg = trg[:N]
+                                    ent = ent[:N]
+                                    mar = mar[:N]
+                            if pm.size == 0 or lb.size == 0:
+                                raise ValueError("empty K-bridge buffers after trimming")
                             # overall ECE + hist（等幅）
                             ece, counts, mconf, macc = ece_and_hist_k(
                                 pm, lb, n_bins=max(2, self._kb_ece_bins)
                             )
                             logs = {"eval/ece_top": float(ece)}
+                            if ent.size > 0:
+                                logs["eval/entropy_mean"] = float(ent.mean())
+                            if mar.size > 0:
+                                logs["eval/margin_mean"] = float(mar.mean())
                             for i, ct in enumerate(counts.tolist()[:10]):
                                 logs[f"eval/conf_hist/bin{i}"] = float(ct)
                                 logs[f"eval/conf_bin_mean/conf{i}"] = float(mconf[i])
@@ -6715,31 +6796,6 @@ def _install_nan_guard_and_ani_from_env(trainer):
                 return manager.make_loader(ds, shuffle, max_len_for_collate)
 
             trainer._make_loader = _types.MethodType(_patched_make_loader, trainer)
-        except Exception:
-            pass
-        # global backward patch for loss scaling (scales loss before backward)
-        try:
-            _orig_backward = torch.Tensor.backward
-
-            def _patched_backward(
-                self, gradient=None, retain_graph=False, create_graph=False, inputs=None
-            ):
-                scale = (
-                    getattr(trainer._ani_manager, "loss_scale", 1.0)
-                    if getattr(trainer, "_ani_manager", None)
-                    else 1.0
-                )
-                if isinstance(scale, (int, float)) and abs(scale - 1.0) > 1e-6:
-                    self = self * float(scale)
-                return _orig_backward(
-                    self,
-                    gradient=gradient,
-                    retain_graph=retain_graph,
-                    create_graph=create_graph,
-                    inputs=inputs,
-                )
-
-            torch.Tensor.backward = _patched_backward
         except Exception:
             pass
 
