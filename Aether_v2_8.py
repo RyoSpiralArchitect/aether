@@ -329,11 +329,11 @@ if _aos.environ.get("AETHER_BACKWARD_GUARD_DISABLED", "0") != "1":
 # ---------------------------------------------------------
 # 3) Light Paged-Attention wrapper for inference-time SDPA
 # ---------------------------------------------------------
-_AETHER_SDPA_ORIG = None
-_AETHER_SDPA_WINDOW = int(_aos.environ.get("AETHER_SDPA_WINDOW", "0"))
+_AETHER_INF_SDPA_ORIG = None
+_AETHER_INF_SDPA_WINDOW = int(_aos.environ.get("AETHER_SDPA_WINDOW", "0"))
 
 
-def enable_tiled_sdpa(
+def enable_inference_sdpa(
     tiled_q: int = 0,
     tiled_k: int = 0,
     compute_in_fp32: bool = True,
@@ -347,22 +347,22 @@ def enable_tiled_sdpa(
 
     tiled_q/tiled_k are accepted for API compatibility (no-ops here).
     """
-    global _AETHER_SDPA_ORIG, _AETHER_SDPA_WINDOW
+    global _AETHER_INF_SDPA_ORIG, _AETHER_INF_SDPA_WINDOW
     try:
         import torch.nn.functional as F
     except Exception:
         return
 
     if window_size is not None:
-        _AETHER_SDPA_WINDOW = int(window_size)
+        _AETHER_INF_SDPA_WINDOW = int(window_size)
 
-    if _AETHER_SDPA_ORIG is None:
-        _AETHER_SDPA_ORIG = F.scaled_dot_product_attention
+    if _AETHER_INF_SDPA_ORIG is None:
+        _AETHER_INF_SDPA_ORIG = F.scaled_dot_product_attention
 
     def _sdpa_wrapper(
         q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None
     ):
-        w = _AETHER_SDPA_WINDOW
+        w = _AETHER_INF_SDPA_WINDOW
         # If generating (q_len==1) and window enabled, crop tail window
         if w and q.size(-2) == 1 and k.size(-2) > w:
             k = k[..., -w:, :]
@@ -371,7 +371,7 @@ def enable_tiled_sdpa(
                 attn_mask = attn_mask[..., -w:]
         if compute_in_fp32:
             qf, kf, vf = q.float(), k.float(), v.float()
-            out = _AETHER_SDPA_ORIG(
+            out = _AETHER_INF_SDPA_ORIG(
                 qf,
                 kf,
                 vf,
@@ -382,7 +382,7 @@ def enable_tiled_sdpa(
             )
             return out.to(q.dtype)
         else:
-            return _AETHER_SDPA_ORIG(
+            return _AETHER_INF_SDPA_ORIG(
                 q,
                 k,
                 v,
@@ -394,20 +394,20 @@ def enable_tiled_sdpa(
 
     F.scaled_dot_product_attention = _sdpa_wrapper
     print(
-        f"[SDPA] wrapper enabled (window={_AETHER_SDPA_WINDOW}, fp32={compute_in_fp32})"
+        f"[SDPA] inference wrapper enabled (window={_AETHER_INF_SDPA_WINDOW}, fp32={compute_in_fp32})"
     )
     
-def disable_tiled_sdpa():
+def disable_inference_sdpa():
     """Restore the original SDPA implementation."""
-    global _AETHER_SDPA_ORIG
+    global _AETHER_INF_SDPA_ORIG
     try:
         import torch.nn.functional as F
 
-        if _AETHER_SDPA_ORIG is not None:
-            F.scaled_dot_product_attention = _AETHER_SDPA_ORIG
-            print("[SDPA] wrapper disabled")
+        if _AETHER_INF_SDPA_ORIG is not None:
+            F.scaled_dot_product_attention = _AETHER_INF_SDPA_ORIG
+            print("[SDPA] inference wrapper disabled")
     finally:
-        _AETHER_SDPA_ORIG = None
+        _AETHER_INF_SDPA_ORIG = None
 
 import os
 import sys
@@ -6883,12 +6883,12 @@ def _sg_cfg_from_env() -> Dict[str, Any]:
         "grad_max": _sg_env_f("AETHER_GUARDIAN_GRAD_MAX", 50.0),
         "grad_sample": _sg_env_i("AETHER_GUARDIAN_GRAD_SAMPLES", 128),  # 0=全件
         # staged actions
-        "lr_backoff": _sg_env_f("AETHER_GUARDIAN_LR_BACKOFF", 0.5),
-        "scale_backoff": _sg_env_f("AETHER_GUARDIAN_SCALE_BACKOFF", 0.5),
+        "lr_backoff": _sg_env_f("AETHER_GUARDIAN_LR_BACKOFF", 1.0),
+        "scale_backoff": _sg_env_f("AETHER_GUARDIAN_SCALE_BACKOFF", 1.0),
         "scale_min": _sg_env_f("AETHER_GUARDIAN_SCALE_MIN", 0.015625),
-        "clip_on": _sg_env_b("AETHER_GUARDIAN_CLIP_ON", 1),
+        "clip_on": _sg_env_b("AETHER_GUARDIAN_CLIP_ON", 0),
         "clip_value": _sg_env_f("AETHER_GUARDIAN_CLIP", 1.0),
-        "skip_on": _sg_env_b("AETHER_GUARDIAN_SKIP", 1),
+        "skip_on": _sg_env_b("AETHER_GUARDIAN_SKIP", 0),
         "max_level": _sg_env_i("AETHER_GUARDIAN_MAX_LEVEL", 3),
         "patience": _sg_env_i("AETHER_GUARDIAN_PATIENCE", 1),  # 何件で次レベル
         "stop_after": _sg_env_i("AETHER_GUARDIAN_STOP_AFTER", 8),
@@ -7042,20 +7042,6 @@ class SpiralGuardian:
         self.level = min(int(self.cfg["max_level"]), self.level + 1)
         if self.cfg["verbose"]:
             print(f"[GUARD] ESCALATE → L{self.level} ({reason})")
-        # staged actions
-        self._apply_lr_backoff()
-        self._apply_scale_backoff()
-        if self.cfg["clip_on"]:
-            try:
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), float(self.cfg["clip_value"])
-                )
-            except Exception:
-                pass
-        if self.cfg["skip_on"]:
-            self._skip_budget = max(
-                self._skip_budget, 1
-            )  # skip next step at least once
         # snapshot on every escalation
         self._snapshot(reason=f"escalate_L{self.level}")
 
