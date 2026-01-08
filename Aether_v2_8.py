@@ -2516,6 +2516,13 @@ class TrainConfig:
     micro_batch: int = 1
     lr: float = 2e-4
     warmup_steps: int = 300
+    lr_hold_steps: int = 64
+    lr_min_mult: float = 0.10
+    lr_plateau_patience: int = 64
+    lr_plateau_delta: float = 0.005
+    lr_plateau_factor: float = 0.85
+    lr_plateau_min_mult: float = 0.25
+    lr_plateau_cooldown: int = 32
     grad_clip: Optional[float] = 1.0
     max_len: int = 2048
     out_dir: str = "runs/v28"
@@ -3206,19 +3213,69 @@ class ChronoScheduler:
         self.step_id = 0
         self.base_lr = cfg.lr
         self.warm = cfg.warmup_steps
+        self.hold = int(getattr(cfg, "lr_hold_steps", 0) or 0)
+        self.min_mult = float(getattr(cfg, "lr_min_mult", 0.0) or 0.0)
+        self.plateau_patience = int(getattr(cfg, "lr_plateau_patience", 0) or 0)
+        self.plateau_delta = float(getattr(cfg, "lr_plateau_delta", 0.0) or 0.0)
+        self.plateau_factor = float(getattr(cfg, "lr_plateau_factor", 1.0) or 1.0)
+        self.plateau_min_mult = float(
+            getattr(cfg, "lr_plateau_min_mult", 0.0) or 0.0
+        )
+        self.plateau_cooldown = int(getattr(cfg, "lr_plateau_cooldown", 0) or 0)
+        self._adaptive_mult = 1.0
+        self._best_loss = None
+        self._plateau_count = 0
+        self._last_plateau_step = -10**9
 
     def _setlr(self, mult: float):
         for g in self.opt.param_groups:
             g["lr"] = self.base_lr * mult
+
+    def update_metrics(self, loss: Optional[float] = None):
+        if self.plateau_patience <= 0 or loss is None:
+            return
+        if not math.isfinite(loss):
+            return
+        if self._best_loss is None:
+            self._best_loss = float(loss)
+            return
+        delta = float(self.plateau_delta)
+        improved = float(loss) < (self._best_loss - delta)
+        if improved:
+            self._best_loss = float(loss)
+            self._plateau_count = 0
+            return
+        self._plateau_count += 1
+        if self._plateau_count < self.plateau_patience:
+            return
+        if (self.step_id - self._last_plateau_step) < self.plateau_cooldown:
+            return
+        self._plateau_count = 0
+        self._last_plateau_step = self.step_id
+        if self.plateau_factor < 1.0:
+            prev = self._adaptive_mult
+            self._adaptive_mult = max(
+                self.plateau_min_mult, self._adaptive_mult * self.plateau_factor
+            )
+            if self._adaptive_mult < prev:
+                print(
+                    f"[SCHED] plateau backoff: mult {prev:.4f} → {self._adaptive_mult:.4f}"
+                )
 
     def step(self):
         self.step_id += 1
         s = self.step_id
         if s <= self.warm:
             m = s / max(1, self.warm)
+        elif s <= (self.warm + self.hold):
+            m = 1.0
         else:
-            t = (s - self.warm) / max(1, self.total - self.warm)
-            m = 0.5 * (1 + math.cos(math.pi * t))
+            decay_span = max(1, self.total - self.warm - self.hold)
+            t = (s - self.warm - self.hold) / decay_span
+            t = min(max(t, 0.0), 1.0)
+            cosine = 0.5 * (1 + math.cos(math.pi * t))
+            m = max(0.0, self.min_mult) + (1.0 - max(0.0, self.min_mult)) * cosine
+        m = max(0.0, m) * max(0.0, self._adaptive_mult)
         self._setlr(m)
         return m
 
@@ -3232,6 +3289,13 @@ class PsyAugment:
         self.span_mask_prob = 0.0
         self.span_len = 8
         self._gen = torch.Generator(device="cpu")
+        self._noise_low = 3
+        self._noise_high = int(getattr(tok, "vocab_size", 0) or 0)
+        byte_base = getattr(tok, "_byte_base", None)
+        byte_fallback = bool(getattr(tok, "_byte_fallback", False))
+        if byte_fallback and isinstance(byte_base, int) and byte_base >= 0:
+            self._noise_low = byte_base
+            self._noise_high = byte_base + 256
         seed_env = _aos.environ.get("AETHER_PSY_SEED")
         try:
             if seed_env is not None:
@@ -3265,7 +3329,71 @@ class PsyAugment:
             else:
                 mask = torch.rand_like(x, dtype=torch.float32) < self.token_dropout
             x.masked_fill_(mask, pad_id)
-        # byte_noise / span_mask は必要なら追加
+        if self.byte_noise > 0 and self._noise_high > self._noise_low:
+            if self._gen.device == x.device:
+                noise_mask = torch.rand(
+                    x.shape, device=x.device, dtype=torch.float32, generator=self._gen
+                ) < self.byte_noise
+            else:
+                noise_mask = torch.rand_like(x, dtype=torch.float32) < self.byte_noise
+            if noise_mask.any():
+                if self._gen.device == x.device:
+                    noise_vals = torch.randint(
+                        self._noise_low,
+                        self._noise_high,
+                        x.shape,
+                        device=x.device,
+                        dtype=x.dtype,
+                        generator=self._gen,
+                    )
+                else:
+                    noise_vals = torch.randint(
+                        self._noise_low,
+                        self._noise_high,
+                        x.shape,
+                        device=x.device,
+                        dtype=x.dtype,
+                    )
+                x = torch.where(noise_mask, noise_vals, x)
+        if self.span_mask_prob > 0 and self.span_len > 0:
+            span_len = max(1, int(self.span_len))
+            for b in range(B):
+                if self._gen.device == x.device:
+                    starts = torch.rand(
+                        (T,),
+                        device=x.device,
+                        dtype=torch.float32,
+                        generator=self._gen,
+                    ) < self.span_mask_prob
+                else:
+                    starts = torch.rand(
+                        (T,), device=x.device, dtype=torch.float32
+                    ) < self.span_mask_prob
+                if not starts.any():
+                    continue
+                start_idx = starts.nonzero(as_tuple=False).view(-1)
+                for s in start_idx.tolist():
+                    if self._gen.device == x.device:
+                        span_jitter = int(
+                            torch.randint(
+                                max(1, span_len // 2),
+                                max(2, span_len * 2),
+                                (1,),
+                                device=x.device,
+                                generator=self._gen,
+                            ).item()
+                        )
+                    else:
+                        span_jitter = int(
+                            torch.randint(
+                                max(1, span_len // 2),
+                                max(2, span_len * 2),
+                                (1,),
+                                device=x.device,
+                            ).item()
+                        )
+                    end = min(T, s + span_jitter)
+                    x[b, s:end] = pad_id
         return x
 
 
@@ -4271,6 +4399,7 @@ class AetherTrainerMPS(AetherTrainerBase):
             steps_per_epoch = self.cfg.max_steps or 10**9
         total_steps = self.cfg.max_steps or int(self.cfg.epochs * steps_per_epoch)
         sched = ChronoScheduler(self.opt, self.cfg, total_steps=total_steps)
+        self.sched = sched
         self._tps_meter.reset()
         self._loss_meter.reset()
         self._last_tok_per_sec = 0.0
@@ -4689,6 +4818,7 @@ class AetherTrainerMPS(AetherTrainerBase):
                 if self._ppl_cap > 0:
                     ppl_base = min(ppl_base, self._ppl_cap)
                 ppl = math.exp(ppl_base)
+                sched.update_metrics(smooth_loss)
                 elapsed = time.time() - t0
                 t0 = time.time()
                 tps = float(total_tok) / max(1e-6, elapsed)
@@ -5677,6 +5807,13 @@ def __aether_main__():
     ap.add_argument("--micro_batch", type=int, default=8)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--warmup", type=int, default=300)
+    ap.add_argument("--lr_hold", type=int, default=64)
+    ap.add_argument("--lr_min_mult", type=float, default=0.10)
+    ap.add_argument("--lr_plateau_patience", type=int, default=64)
+    ap.add_argument("--lr_plateau_delta", type=float, default=0.005)
+    ap.add_argument("--lr_plateau_factor", type=float, default=0.85)
+    ap.add_argument("--lr_plateau_min_mult", type=float, default=0.25)
+    ap.add_argument("--lr_plateau_cooldown", type=int, default=32)
     ap.add_argument("--out_dir", type=str, default="runs/v28")
     ap.add_argument("--tiled_q", type=int, default=192)
     ap.add_argument("--tiled_k", type=int, default=320)
@@ -5906,6 +6043,13 @@ def __aether_main__():
         micro_batch=args.micro_batch,
         lr=args.lr,
         warmup_steps=args.warmup,
+        lr_hold_steps=int(args.lr_hold),
+        lr_min_mult=float(args.lr_min_mult),
+        lr_plateau_patience=int(args.lr_plateau_patience),
+        lr_plateau_delta=float(args.lr_plateau_delta),
+        lr_plateau_factor=float(args.lr_plateau_factor),
+        lr_plateau_min_mult=float(args.lr_plateau_min_mult),
+        lr_plateau_cooldown=int(args.lr_plateau_cooldown),
         grad_clip=1.0,
         max_len=args.max_len,
         out_dir=args.out_dir,
